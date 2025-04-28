@@ -1,3 +1,6 @@
+[![Update README Date](https://github.com/rayotoo/Cloud-Based-NGS-Pipeline-Development/actions/workflows/update_readme_date.yml/badge.svg)](https://github.com/rayotoo/Cloud-Based-NGS-Pipeline-Development/actions/workflows/update_readme_date.yml)
+
+
 # Cloud-Optimized NGS Analysis Pipeline
 
 ### Empowering Scalable and Reproducible Genomic Insights
