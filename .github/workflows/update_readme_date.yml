@@ -23,8 +23,6 @@ jobs:
 
       - name: Update README
         uses: actions/github-script@v6
-        env:
-        README_PATH: README.md # Adjust if your README has a different name
         with:
           script: |
             const fs = require('fs');
@@ -40,6 +38,8 @@ jobs:
             }
 
             fs.writeFileSync(readmePath, content);
+          env:
+            README_PATH: README.md # Adjust if your README has a different name
 
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
