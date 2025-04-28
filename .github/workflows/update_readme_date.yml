@@ -1,6 +1,9 @@
 name: Update README Date
 
 on:
+  push:
+    branches:
+      - main # Or your default branch name
   schedule:
     - cron: '0 0 * * *' # Runs every day at midnight UTC
 
