@@ -38,14 +38,7 @@ Before deploying and executing this pipeline, ensure the following software and 
         aws configure
         ```
         Follow the prompts to enter your AWS Access Key ID, Secret Access Key, default region, and output format.
-    * **For GCP:**
-        ```bash
-        gcloud auth login
-        ```
-        Authorize the gcloud CLI to access your Google Cloud account. You may also need to set the active project:
-        ```bash
-        gcloud config set project YOUR_PROJECT_ID
-        ```
+
 
 **Pipeline Modules: A Step-by-Step Analysis**
 
