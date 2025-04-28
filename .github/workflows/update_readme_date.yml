@@ -7,6 +7,9 @@ on:
   schedule:
     - cron: '0 0 * * *' # Runs every day at midnight UTC
 
+permissions:
+  contents: write # This grants write permission to the repository's contents
+
 jobs:
   update-date:
     runs-on: ubuntu-latest
@@ -21,7 +24,7 @@ jobs:
       - name: Update README
         uses: actions/github-script@v6
         env:
-          README_PATH: README.md # Adjust if your README has a different name
+        README_PATH: README.md # Adjust if your README has a different name
         with:
           script: |
             const fs = require('fs');
