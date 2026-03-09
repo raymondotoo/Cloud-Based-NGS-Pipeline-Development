@@ -1,0 +1,373 @@
+---
+title: "07a_Functional_Analysis_GSEA (fixed)"
+author: "automated-patch"
+date: "2026-03-05"
+output: pdf_document
+---
+
+# Functional Analysis/Network Analysis - Summary of the Workflow
+
+1.  **Annotation:** Maps SOMAmers to Entrez IDs.
+2.  **Ranking:** Uses WGCNA kME values to rank every protein in the dataset for each module.
+3.  **Enrichment:** Runs `fgseaMultilevel` against three distinct databases (Hallmark, Reactome, GO).
+4.  **Integration:** Combines results into a single, structured data object.
+5.  **Visualization:** Creates heatmaps, dot plots, and network plots for interpretation.
+
+# 1. Setup
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+
+results_dir <- file.path(base_dir, "results", "functional_analysis_gsea")
+plots_dir <- file.path(results_dir, "plots")
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r libs, message=FALSE, warning=FALSE}
+pkgs <- c("WGCNA", "dplyr", "readr", "clusterProfiler", "org.Hs.eg.db", "ReactomePA",
+          "ggplot2", "openxlsx", "fgsea", "msigdbr", "tidyr", "tibble", "pheatmap", "stringr", "enrichplot")
+
+# Install missing packages
+for(pk in pkgs){
+  if(!requireNamespace(pk, quietly = TRUE)){
+    message("Installing missing package: ", pk)
+    is_bioc <- pk %in% c("WGCNA", "clusterProfiler", "org.Hs.eg.db", "ReactomePA", "enrichplot", "fgsea", "msigdbr")
+    if(is_bioc){
+      if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(pk, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pk)
+    }
+  }
+}
+
+# Load all packages
+lapply(pkgs, library, character.only = TRUE)
+options(stringsAsFactors = FALSE)
+```
+
+# 2. Load Data & Prepare for GSEA
+
+```{r load-data}
+# Load WGCNA results (expr, moduleColors, MEs)
+wgcna_file <- file.path(base_dir, "results", "wgcna", "WGCNA2_core_outputs.RData")
+if(!file.exists(wgcna_file)) stop("WGCNA output file not found: ", wgcna_file)
+load(wgcna_file)
+
+# Validate loaded objects
+req_objs <- c("expr", "moduleColors", "MEs")
+if(!all(req_objs %in% ls())) stop("Loaded RData is missing one of: ", paste(req_objs, collapse=", "))
+if(is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
+stopifnot(identical(colnames(expr), names(moduleColors)))
+
+# Get module list (excluding grey)
+modules <- setdiff(unique(moduleColors), "grey")
+
+# Compute kME (module membership)
+datKME <- as.data.frame(cor(expr, MEs, use = "p"))
+colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
+rownames(datKME) <- colnames(expr)
+```
+
+# 3. Annotation Mapping (SOMAmer -> Entrez)
+
+```{r id-mapping}
+# Load feature annotation
+analyte_file <- file.path(base_dir, "data", "CSF_SOMAscan7k_analyte_information.tsv")
+if(!file.exists(analyte_file)) stop("Analyte info file not found: ", analyte_file)
+analyte_info <- read.delim(analyte_file, sep = "\t", header = TRUE, check.names = FALSE)
+
+# Create a mapping key from SOMAmer to Symbol
+feature_key <- analyte_info %>%
+  filter(Analytes %in% colnames(expr)) %>%
+  select(Analytes, EntrezGeneSymbol) %>%
+  distinct() %>%
+  rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+
+# Map Symbol to Entrez ID
+symbol_map <- bitr(
+  feature_key$SYMBOL,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>% distinct(SYMBOL, .keep_all = TRUE)
+
+# Final mapping table for the entire dataset
+feature_map <- inner_join(feature_key, symbol_map, by = "SYMBOL")
+message("Mapped ", nrow(feature_map), " SOMAmers to Entrez IDs.")
+```
+
+# 4. Load Gene Sets
+
+```{r load-gene-sets}
+hm <- msigdbr(species = "Homo sapiens", category = "H")
+react <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+go <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+
+gene_sets <- list(
+  Hallmark = split(hm$entrez_gene, as.character(hm$gs_name)),
+  Reactome = split(react$entrez_gene, as.character(react$gs_name)),
+  GO_BP = split(go$entrez_gene, as.character(go$gs_name))
+)
+
+message("Loaded gene sets:")
+message("  Hallmark: ", length(gene_sets$Hallmark))
+message("  Reactome: ", length(gene_sets$Reactome))
+message("  GO_BP: ", length(gene_sets$GO_BP))
+```
+
+# 5. GSEA Function
+
+```{r gsea-function}
+# Corrected GSEA function: Ranks ALL proteins by kME for a given module.
+run_fgsea_module <- function(module, pathway_sets) {
+  kme_col <- paste0("kME_", module)
+  if (!kme_col %in% colnames(datKME)) return(NULL)
+
+  # Rank all proteins by their kME for this module
+  ranks_df <- data.frame(
+    SOMAmer = rownames(datKME),
+    kME = datKME[[kme_col]]
+  ) %>%
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(is.finite(kME)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+
+  if (nrow(ranks_df) < 50) return(NULL)
+
+  gene_ranks <- setNames(ranks_df$kME, ranks_df$ENTREZID)
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+
+  fgseaMultilevel(
+    pathways = pathway_sets,
+    stats = gene_ranks,
+    minSize = 15,
+    maxSize = 500,
+    nproc = 1 # Use 1 for safety in RMarkdown
+  )
+}
+```
+
+# 6. Run GSEA Across All Modules and Databases
+
+```{r run-gsea-all}
+all_gsea_results <- list()
+
+for (mod in modules) {
+  message("Processing module: ", mod)
+  
+  # Run GSEA for each database
+  h_res <- run_fgsea_module(mod, gene_sets$Hallmark)
+  r_res <- run_fgsea_module(mod, gene_sets$Reactome)
+  g_res <- run_fgsea_module(mod, gene_sets$GO_BP)
+  
+  # Combine results for the module
+  combined <- bind_rows(
+    if (!is.null(h_res)) as_tibble(h_res) %>% mutate(Source = "Hallmark"),
+    if (!is.null(r_res)) as_tibble(r_res) %>% mutate(Source = "Reactome"),
+    if (!is.null(g_res)) as_tibble(g_res) %>% mutate(Source = "GO_BP")
+  )
+  
+  if (nrow(combined) > 0) {
+    all_gsea_results[[mod]] <- combined
+  } else {
+    message("  -> No significant GSEA results for module ", mod)
+  }
+}
+```
+
+# 7. Save All Results to Excel
+
+```{r save-excel}
+# Single combined file
+wb_all <- createWorkbook()
+for (mod in names(all_gsea_results)) {
+  df <- all_gsea_results[[mod]] %>% filter(padj < 0.05) %>% arrange(Source, padj)
+  if (nrow(df) > 0) {
+    addWorksheet(wb_all, mod)
+    writeData(wb_all, mod, df)
+  }
+}
+saveWorkbook(wb_all, file.path(results_dir, "Combined_GSEA_Results.xlsx"), overwrite = TRUE)
+
+# Database-specific files
+for (src in names(gene_sets)) {
+  wb_src <- createWorkbook()
+  for (mod in names(all_gsea_results)) {
+    df <- all_gsea_results[[mod]] %>% filter(Source == src, padj < 0.05) %>% arrange(padj)
+    if (nrow(df) > 0) {
+      addWorksheet(wb_src, mod)
+      writeData(wb_src, mod, df)
+    }
+  }
+  if(length(wb_src$worksheets) > 0){
+    saveWorkbook(wb_src, file.path(results_dir, paste0("GSEA_", src, "_Results.xlsx")), overwrite = TRUE)
+  }
+}
+message("GSEA results saved to: ", results_dir)
+```
+
+# 8. Visualization: Multi-Module Heatmap
+
+```{r plot-heatmap}
+for (src in names(gene_sets)) {
+  # Combine results for this source across all modules
+  combined_df <- bind_rows(lapply(names(all_gsea_results), function(m) {
+    all_gsea_results[[m]] %>%
+      filter(Source == src, padj < 0.05) %>%
+      mutate(Module = m) %>%
+      select(pathway, NES, Module)
+  }))
+  
+  if (nrow(combined_df) > 1) {
+    heatmap_mat <- combined_df %>%
+      distinct(pathway, Module, .keep_all = TRUE) %>%
+      pivot_wider(names_from = Module, values_from = NES, values_fill = 0) %>%
+      column_to_rownames("pathway")
+
+    # Filter pathways present in at least 2 modules
+    heatmap_mat <- heatmap_mat[rowSums(heatmap_mat != 0) >= 2, ]
+    if(nrow(heatmap_mat) < 2) next
+    
+    # Auto-scale plot dimensions
+    width_in <- max(10, ncol(heatmap_mat) * 0.8)
+    height_in <- max(8, nrow(heatmap_mat) * 0.25)
+    
+    p <- pheatmap(
+      as.matrix(heatmap_mat),
+      color = colorRampPalette(c("blue", "white", "red"))(100),
+      main = paste("Significant Pathway NES Across Modules -", src),
+      fontsize_row = 8,
+      border_color = "grey60",
+      clustering_method = "ward.D2"
+    )
+    
+    ggsave(file.path(plots_dir, paste0("Heatmap_", src, ".pdf")), p, width = width_in, height = height_in, limitsize = FALSE)
+    message("Saved heatmap for ", src)
+  }
+}
+```
+
+# 9. Visualization: Dot Plots per Module
+
+```{r plot-dotplots}
+plot_fgsea_dot <- function(df, module_name, source_name) {
+  sig <- df %>% filter(Source == source_name, padj < 0.05)
+  if (nrow(sig) == 0) return(NULL)
+  
+  top_sig <- sig %>% 
+    slice_max(order_by = abs(NES), n = 15) %>%
+    mutate(
+      clean_pathway = str_wrap(gsub("^(GO_BP_|HALLMARK_|REACTOME_)", "", pathway), width = 50)
+    )
+    
+  ggplot(top_sig, aes(x = NES, y = reorder(clean_pathway, NES), size = -log10(padj), color = NES)) +
+    geom_point(alpha = 0.8) +
+    scale_color_gradient2(low = "#0571b0", mid = "white", high = "#ca0020") +
+    theme_bw(base_size = 10) +
+    labs(
+      title = paste("Module:", module_name, "| Database:", source_name),
+      x = "Normalized Enrichment Score (NES)", y = NULL
+    )
+}
+
+for (mod in names(all_gsea_results)) {
+  for (src in names(gene_sets)) {
+    p <- plot_fgsea_dot(all_gsea_results[[mod]], mod, src)
+    if (!is.null(p)) {
+      ggsave(
+        filename = file.path(plots_dir, paste0("DotPlot_", mod, "_", src, ".pdf")),
+        plot = p, width = 8, height = 6, useDingbats = FALSE
+      )
+    }
+  }
+}
+```
+
+# 10. Visualization: Cnet Plots
+
+```{r plot-cnet}
+plot_module_network <- function(df, module_name, source_name, n_pathways = 5) {
+  sig_res <- df %>% 
+    filter(Source == source_name, padj < 0.05) %>% 
+    slice_max(order_by = abs(NES), n = n_pathways)
+  if(nrow(sig_res) == 0) return(NULL)
+
+  gene_list <- sig_res$leadingEdge
+  names(gene_list) <- sig_res$pathway
+  
+  id_to_symbol <- setNames(feature_map$SYMBOL, feature_map$ENTREZID)
+  gene_list_symbols <- lapply(gene_list, function(x) {
+    unname(id_to_symbol[as.character(x)]) %>% na.omit()
+  })
+
+  cnetplot(gene_list_symbols, 
+           showCategory = n_pathways,
+           #colorEdge = TRUE,
+           #color_edge = "category",
+           layout = "circle") +     
+    labs(title = paste("Module:", module_name, "| DB:", source_name)) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.margin = margin(20,20,20,20))
+}
+
+for (mod in names(all_gsea_results)) {
+  for (src in names(gene_sets)) {
+    p_net <- plot_module_network(all_gsea_results[[mod]], mod, src)
+    if (!is.null(p_net)) {
+      ggsave(
+        filename = file.path(plots_dir, paste0("Network_", mod, "_", src, ".pdf")),
+        plot = p_net, width = 10, height = 8, useDingbats = FALSE
+      )
+    }
+  }
+}
+```
+
+# 11. Visualization: GSEA Running Score Plots
+
+```{r plot-mountain}
+score_plots_dir <- file.path(plots_dir, "GSEA_Scores")
+dir.create(score_plots_dir, showWarnings = FALSE)
+
+for (mod in names(all_gsea_results)) {
+  # Reconstruct the rank vector for the module
+  ranks_df <- data.frame(SOMAmer = rownames(datKME), kME = datKME[[paste0("kME_", mod)]]) %>%
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(is.finite(kME)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+  if(nrow(ranks_df) == 0) next
+  gene_ranks <- setNames(ranks_df$kME, ranks_df$ENTREZID)
+
+  for (src in names(gene_sets)) {
+    current_sets <- gene_sets[[src]]
+    top_paths <- all_gsea_results[[mod]] %>%
+      filter(Source == src, padj < 0.05) %>%
+      slice_min(order_by = padj, n = 2)
+    if (nrow(top_paths) == 0) next
+
+    for (i in 1:nrow(top_paths)) {
+      path_name <- top_paths$pathway[i]
+      stats <- top_paths[i, ]
+      
+      p <- plotEnrichment(current_sets[[path_name]], gene_ranks) +
+        labs(
+          title = paste("Module:", mod, "-", src),
+          subtitle = str_wrap(path_name, width = 80),
+          caption = paste0("NES: ", round(stats$NES, 2), " | padj: ", format.pval(stats$padj, digits = 2))
+        ) +
+        theme_bw() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+      clean_path_name <- str_trunc(gsub("[^[:alnum:]]", "_", path_name), 40)
+      ggsave(
+        filename = file.path(score_plots_dir, paste0("Score_", mod, "_", src, "_", i, "_", clean_path_name, ".pdf")),
+        plot = p, width = 8, height = 6, useDingbats = FALSE
+      )
+    }
+  }
+}
+message("GSEA Mountain plots saved to: ", score_plots_dir)
+```

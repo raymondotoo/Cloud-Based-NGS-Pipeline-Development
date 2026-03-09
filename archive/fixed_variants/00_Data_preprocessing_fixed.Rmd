@@ -1,0 +1,248 @@
+---
+title: "Data_preprocessing (fixed)"
+author: "Raymond Otoo"
+date: "2026-1-26"
+output: pdf_document
+---
+
+# Notes
+
+- This version fixes portability (removes hard-coded Windows paths), duplicate handling, row alignment, result directory creation, and makes imputation more robust.
+
+```{r setup, include=FALSE}
+# Check and install required packages (CRAN + Bioconductor dependency `pcaMethods`)
+required_cran <- c("here", "openxlsx", "dplyr", "imputeLCMD")
+install_if_missing <- function(pkgs){
+  for(p in pkgs){
+    if(!requireNamespace(p, quietly = TRUE)){
+      install.packages(p, repos = "https://cloud.r-project.org")
+    }
+  }
+}
+install_if_missing(required_cran)
+
+if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org")
+if(!requireNamespace("pcaMethods", quietly = TRUE)) BiocManager::install("pcaMethods")
+# imputeLCMD depends on Bioconductor package 'impute'
+if(!requireNamespace("impute", quietly = TRUE)) BiocManager::install("impute")
+
+# Now load libraries
+library(here)
+library(openxlsx)
+library(dplyr)
+library(imputeLCMD)
+
+## Use Proteomics folder as project base so data/results live under Proteomics/
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+set.seed(12345)
+
+# ensure results directory exists under Proteomics/
+dir.create(file.path(base_dir, "results"), showWarnings = FALSE, recursive = TRUE)
+
+getwd()
+```
+
+# 1. Read Protein Expression Matrix and Phenotype data (relative paths)
+```{r}
+# adjust filenames as needed; expected under project `data/` folder
+# Try multiple candidate locations for data files (project-level `data/` or `Proteomics/data/`)
+prot_file <- file.path(base_dir, "data", "all_ADRC_ADNI_proteomics_samples_Zscore_soma_only.xlsx")
+pheno_file <- file.path(base_dir, "data", "all_ADRC_ADNI_csfprot_wmhpheno_CLEAN_FINAL_10_24_2025.xlsx")
+pc_file <- file.path(base_dir, "data", "WMH_PCA_scores_PC1_PC3.csv")
+
+if(!file.exists(prot_file)) stop("Proteomics file not found: ", prot_file)
+if(!file.exists(pheno_file)) stop("Pheno file not found: ", pheno_file)
+if(!file.exists(pc_file)) {
+  warning("PC file not found; continuing without PC merge: ", pc_file)
+  pc_file <- NULL
+}
+
+ProtoData <- read.xlsx(prot_file)
+PhenoInfo <- read.xlsx(pheno_file)
+pc1_3 <- if(!is.null(pc_file)) read.csv(pc_file) else NULL
+
+```
+
+
+# Report resolved input and planned output paths for reproducibility
+```{r paths_check, echo=TRUE}
+message("Resolved input files:")
+message("  prot_file: ", prot_file)
+message("  pheno_file: ", pheno_file)
+message("  pc_file: ", ifelse(is.null(pc_file), "<none>", pc_file))
+
+out_rdata <- file.path(base_dir, "results", "00_output.RData")
+out_pheno <- file.path(base_dir, "results", "PhenoInfo_numeric.xlsx")
+out_proto <- file.path(base_dir, "results", "ProtoData_filtered.xlsx")
+
+message("Planned output files:")
+message("  ", out_rdata)
+message("  ", out_pheno)
+message("  ", out_proto)
+```
+
+```{r}
+# Flip PC1 sign for interpretability (as in original)
+if("PC1" %in% colnames(pc1_3)) pc1_3$PC1 <- -pc1_3$PC1
+
+# merge PCs into phenotype if matching ID column exists in pc1_3
+if("ID" %in% colnames(pc1_3)) {
+  # prefer merging by ID column
+  PhenoInfo <- left_join(PhenoInfo, pc1_3[, c("ID", setdiff(colnames(pc1_3), "ID"))], by = "ID")
+} else {
+  # if pc1_3 has sample order aligned, bind by columns (best-effort)
+  warning("pc1_3 has no ID column; check alignment before relying on these PCs.")
+}
+
+```
+
+# 2. Subset to SOMA panel if column exists
+```{r}
+if("Panel.SOMA" %in% colnames(ProtoData)) {
+  ProtoData <- subset(ProtoData, Panel.SOMA == 1)
+}
+if("Panel.SOMA" %in% colnames(PhenoInfo)) {
+  PhenoInfo <- subset(PhenoInfo, Panel.SOMA == 1)
+}
+```
+
+# 3. Handling missing Values - Missing value Imputation
+```{r}
+impute_with_metadata <- function(df,
+                                 model.selector = 1,
+                                 method.MAR = "MLE",
+                                 method.MNAR = "QRILC") {
+  # Preserve ID order if present; keep original ID column as `orig_ID`
+  if("ID" %in% colnames(df)) {
+    ids <- as.character(df$ID)
+    df$orig_ID <- as.character(df$ID)
+    df$ID <- NULL
+  } else {
+    ids <- rownames(df)
+  }
+
+  metadata <- df[, !sapply(df, is.numeric), drop = FALSE]
+  numeric_data <- df[, sapply(df, is.numeric), drop = FALSE]
+
+  # Drop all-NA and zero-variance numeric columns
+  numeric_matrix <- as.matrix(numeric_data)
+  if(ncol(numeric_matrix) == 0) stop("No numeric columns to impute")
+  numeric_matrix <- numeric_matrix[, colSums(!is.na(numeric_matrix)) > 0, drop = FALSE]
+  numeric_matrix <- numeric_matrix[, apply(numeric_matrix, 2, function(x) length(unique(na.omit(x))) > 1), drop = FALSE]
+
+  # Run imputation
+  numeric_imputed <- impute.MAR.MNAR(numeric_matrix,
+                                     model.selector = model.selector,
+                                     method.MAR = method.MAR,
+                                     method.MNAR = method.MNAR)
+
+  numeric_imputed <- as.data.frame(numeric_imputed)
+
+  # Recombine metadata and imputed numeric data; preserve original IDs and ensure unique rownames
+  result <- cbind(metadata, numeric_imputed)
+  if(length(ids) == nrow(result)){
+    if(any(duplicated(ids))){
+      warning("Duplicate IDs detected; making them unique with make.unique(). Consider deduplicating upstream.")
+      ids <- make.unique(ids)
+    }
+    rownames(result) <- ids
+  }
+  return(result)
+}
+
+# Run imputation (keeps metadata columns intact)
+ProtoData <- impute_with_metadata(ProtoData)
+
+# report NA count after imputation
+message("NA count after imputation: ", sum(is.na(ProtoData)))
+```
+
+# 4. Identify and remove duplicates (use `ID` column explicitly)
+```{r}
+if("ID" %in% colnames(ProtoData)) {
+  total_duplicates_ProtoData <- sum(duplicated(ProtoData$ID))
+  ProtoData <- ProtoData[!duplicated(ProtoData$ID), , drop = FALSE]
+} else {
+  total_duplicates_ProtoData <- sum(duplicated(rownames(ProtoData)))
+  ProtoData <- ProtoData[!duplicated(rownames(ProtoData)), , drop = FALSE]
+}
+
+if("ID" %in% colnames(PhenoInfo)) {
+  total_duplicates_pheno <- sum(duplicated(PhenoInfo$ID))
+  PhenoInfo <- PhenoInfo[!duplicated(PhenoInfo$ID), , drop = FALSE]
+} else {
+  total_duplicates_pheno <- sum(duplicated(rownames(PhenoInfo)))
+  PhenoInfo <- PhenoInfo[!duplicated(rownames(PhenoInfo)), , drop = FALSE]
+}
+
+message("Duplicates removed - ProtoData: ", total_duplicates_ProtoData, "; PhenoInfo: ", total_duplicates_pheno)
+```
+
+# 5. Set rownames from `ID` and align datasets
+```{r}
+if("ID" %in% colnames(PhenoInfo)) {
+  rownames(PhenoInfo) <- as.character(PhenoInfo$ID)
+  PhenoInfo$ID <- NULL
+}
+if("ID" %in% colnames(ProtoData)) {
+  rownames(ProtoData) <- as.character(ProtoData$ID)
+  ProtoData$ID <- NULL
+}
+
+common_ids <- intersect(rownames(PhenoInfo), rownames(ProtoData))
+if(length(common_ids) == 0) stop("No common sample IDs between phenotype and proteomics data")
+
+PhenoInfo <- PhenoInfo[common_ids, , drop = FALSE]
+ProtoData <- ProtoData[common_ids, , drop = FALSE]
+
+stopifnot(all(rownames(PhenoInfo) == rownames(ProtoData)))
+```
+
+# 6. Filter/select phenotype columns (use names where possible)
+```{r}
+# The original used numeric column indices which may break; adapt names if available.
+# If the expected names are not present, keep the full PhenoInfo and warn.
+expected_cols <- c("Sex","Age_at_draw","PC1","PC2","PC3","SBP","DM2","HTNscore","bmi","fsrp","d_cmb","lacunar_stroke","stroke","caa_diag","caa","E4","closest_cdr","cdr_sob","AD_status","cog_status")
+present <- expected_cols %in% colnames(PhenoInfo)
+if(any(present)) {
+  PhenoInfo_filtered_updated <- PhenoInfo[, intersect(expected_cols, colnames(PhenoInfo)), drop = FALSE]
+} else {
+  warning("Expected phenotype columns not found; keeping original PhenoInfo object for downstream steps")
+  PhenoInfo_filtered_updated <- PhenoInfo
+}
+
+```
+
+# 7. Binarize / transform key variables safely
+```{r}
+if("Sex" %in% colnames(PhenoInfo_filtered_updated)) {
+  PhenoInfo_filtered_updated$Sex <- ifelse(as.character(PhenoInfo_filtered_updated$Sex) == "Male", 1, 0)
+}
+if("Cohort" %in% colnames(PhenoInfo_filtered_updated)) {
+  PhenoInfo_filtered_updated$Cohort_bin <- ifelse(as.character(PhenoInfo_filtered_updated$Cohort) == "ADNI", 1, 0)
+}
+if("caa_diag" %in% colnames(PhenoInfo_filtered_updated)) {
+  PhenoInfo_filtered_updated$caa_prob <- ifelse(as.character(PhenoInfo_filtered_updated$caa_diag) == "probable", 1, 0)
+}
+if("closest_cdr" %in% colnames(PhenoInfo_filtered_updated)) {
+  PhenoInfo_filtered_updated$closest_cdr <- ifelse(as.character(PhenoInfo_filtered_updated$closest_cdr) == "0", 0, 1)
+}
+if("lacunar_stroke" %in% colnames(PhenoInfo_filtered_updated)) {
+  PhenoInfo_filtered_updated$lacunar_stroke <- ifelse(as.character(PhenoInfo_filtered_updated$lacunar_stroke) == "0", 0, 1)
+}
+if("E4" %in% colnames(PhenoInfo_filtered_updated)) {
+  PhenoInfo_filtered_updated$E4status <- ifelse(as.character(PhenoInfo_filtered_updated$E4) == "0", 0, 1)
+}
+```
+
+# 8. Save outputs
+```{r}
+save(ProtoData, PhenoInfo_filtered_updated, file = file.path(base_dir, "results", "00_output.RData"))
+write.xlsx(PhenoInfo_filtered_updated, file.path(base_dir, "results", "PhenoInfo_numeric.xlsx"), rowNames = TRUE)
+write.xlsx(ProtoData, file.path(base_dir, "results", "ProtoData_filtered.xlsx"), rowNames = TRUE)
+
+message("Saved results to ", file.path(base_dir, "results"))
+```
+
+# End

@@ -1,0 +1,305 @@
+---
+title: "PCA_cleaned"
+author: "Raymond Otoo"
+date: "2026-01-23"
+output: pdf_document
+---
+
+```{r}
+library(openxlsx)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+```
+
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+getwd()
+```
+
+```{r}
+# Protein expression (already z-scored)
+ProtoData <- read.xlsx(
+  file.path(paths$data_dir, "all_ADRC_ADNI_proteomics_samples_Zscore_soma_only.xlsx")
+)
+ 
+# Phenotype data
+PhenoInfo <- read.xlsx(
+  file.path(paths$data_dir, "all_ADRC_ADNI_csfprot_wmhpheno_CLEAN_FINAL_10_24_2025.xlsx")
+)
+```
+
+
+```{r}
+wmh_vars <- PhenoInfo[, c(
+  "wmh_juxta",
+  "wmh_frontal",
+  "wmh_pv",
+  "wmh_parietal",
+  "wmh_posterior"
+)]
+ 
+wmh_scaled <- scale(wmh_vars)
+```
+
+```{r}
+pca_res <- prcomp(wmh_scaled, center = TRUE, scale. = TRUE)
+ 
+# Variance explained
+summary(pca_res)
+```
+```{r}
+pca_res$x
+```
+
+#save  PC1–PC3 scores to file 
+```{r}
+# Extract PC1–PC3 scores
+pca_scores_1_3 <- as.data.frame(pca_res$x[, 1:3])
+ 
+# Add sample names from original phenotype file
+pca_scores_1_3$SampleID <- PhenoInfo$ID
+ 
+# Reorder columns
+pca_scores_1_3 <- pca_scores_1_3 %>%
+  dplyr::select(SampleID, PC1, PC2, PC3)
+ 
+# Save to file
+write.csv(
+  pca_scores_1_3,
+  file = file.path(paths$pca_dir, "WMH_PCA_scores_PC1_PC3.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+dim(PhenoInfo)
+```
+
+
+```{r}
+loadings_raw <- as.data.frame(pca_res$rotation)
+loadings_raw$Trait <- rownames(loadings_raw)
+```
+
+
+```{r}
+pca_scores <- as.data.frame(pca_res$x)
+```
+
+```{r}
+arrow_scale <- 3
+loadings_plot <- loadings_raw
+loadings_plot[, c("PC1", "PC2")] <- loadings_plot[, c("PC1", "PC2")] * arrow_scale
+ 
+png(file.path(paths$pca_dir, "pca_wmh_biplot.png"), width = 1600, height = 1600, res = 200)
+ 
+ggplot(pca_scores, aes(PC1, PC2)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_segment(
+    data = loadings_plot,
+    aes(x = 0, y = 0, xend = PC1, yend = PC2),
+    arrow = arrow(length = unit(0.3, "cm")),
+    color = "red"
+  ) +
+  geom_text_repel(
+    data = loadings_plot,
+    aes(x = PC1, y = PC2, label = Trait),
+    color = "red",
+    size = 4
+  ) +
+  theme_minimal() +
+  labs(
+    title = "PCA of WMH Traits",
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
+  )
+ 
+dev.off()
+```
+
+
+```{r}
+# Prepare loadings for PCs 1–3
+loadings_long <- loadings_raw %>%
+  dplyr::select(Trait, PC1, PC2, PC3) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "PC",
+    values_to = "Loading"
+  )
+ 
+png(file.path(paths$pca_dir, "wmh_pca_loadings_barplot.png"), width = 2000, height = 1000, res = 200)
+ 
+ggplot(loadings_long, aes(x = Trait, y = Loading, fill = PC)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  theme_minimal() +
+  labs(
+    title = "WMH PCA Loadings (PC1–PC3)",
+    x = "WMH Region",
+    y = "PCA Loading"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+ 
+dev.off()
+```
+
+
+```{r}
+loading_mat <- loadings_raw[, c("PC1", "PC2", "PC3")]
+rownames(loading_mat) <- loadings_raw$Trait
+ 
+# Optional ordering (helps interpretation)
+loading_mat <- loading_mat[c(
+  "wmh_pv",
+  "wmh_juxta",
+  "wmh_frontal",
+  "wmh_parietal",
+  "wmh_posterior"
+), ]
+ 
+png(file.path(paths$pca_dir, "wmh_pca_loadings_heatmap.png"), width = 1200, height = 800, res = 200)
+ 
+pheatmap(
+  loading_mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "PCA Loadings of WMH Traits (PC1–PC3)"
+)
+ 
+dev.off()
+```
+
+
+```{r}
+range(loadings_raw[, c("PC1", "PC2", "PC3")])
+```
+
+
+#=====================================================================================
+#
+# 00-  PCA Biplot: PC2 vs PC3
+#=====================================================================================
+```{r}
+# =========================
+# PCA Biplot: PC2 vs PC3
+# =========================
+ 
+arrow_scale_23 <- 3
+loadings_plot_23 <- loadings_raw
+loadings_plot_23[, c("PC2", "PC3")] <- loadings_plot_23[, c("PC2", "PC3")] * arrow_scale_23
+ 
+png(file.path(paths$pca_dir, "pca_wmh_biplot_PC2_PC3.png"), width = 1600, height = 1600, res = 200)
+ 
+ggplot(pca_scores, aes(PC2, PC3)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_segment(
+    data = loadings_plot_23,
+    aes(x = 0, y = 0, xend = PC2, yend = PC3),
+    arrow = arrow(length = unit(0.3, "cm")),
+    color = "red"
+  ) +
+  geom_text_repel(
+    data = loadings_plot_23,
+    aes(x = PC2, y = PC3, label = Trait),
+    color = "red",
+    size = 4
+  ) +
+  theme_minimal() +
+  labs(
+    title = "PCA of WMH Traits (PC2 vs PC3)",
+    x = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)"),
+    y = paste0("PC3 (", round(summary(pca_res)$importance[2,3] * 100, 1), "%)")
+  )
+ 
+dev.off()
+```
+
+
+```{r}
+# =========================
+# Flip PC1 loadings for interpretation
+# =========================
+ 
+loadings_flipped <- loadings_raw
+loadings_flipped$PC1 <- -loadings_flipped$PC1
+```
+
+
+#=====================================================================================
+#
+# 00- PCA loadings barplot PC1 flipped
+#=====================================================================================
+
+```{r}
+loadings_long_flipped <- loadings_flipped %>%
+  dplyr::select(Trait, PC1, PC2, PC3) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "PC",
+    values_to = "Loading"
+  )
+ 
+png(file.path(paths$pca_dir, "wmh_pca_loadings_barplot_PC1_flipped.png"), width = 2000, height = 1000, res = 200)
+ 
+ggplot(loadings_long_flipped, aes(x = Trait, y = Loading, fill = PC)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  theme_minimal() +
+  labs(
+    title = "WMH PCA Loadings (PC1 Flipped)",
+    x = "WMH Region",
+    y = "PCA Loading"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+ 
+dev.off()
+```
+
+
+#=====================================================================================
+#
+# 00- PCA loadings heatmap PC1 flipped
+#=====================================================================================
+```{r}
+loading_mat_flipped <- loadings_flipped[, c("PC1", "PC2", "PC3")]
+rownames(loading_mat_flipped) <- loadings_flipped$Trait
+ 
+loading_mat_flipped <- loading_mat_flipped[c(
+  "wmh_pv",
+  "wmh_juxta",
+  "wmh_frontal",
+  "wmh_parietal",
+  "wmh_posterior"
+), ]
+ 
+png(file.path(paths$pca_dir, "wmh_pca_loadings_heatmap_PC1_flipped.png"), width = 1200, height = 800, res = 200)
+ 
+pheatmap(
+  loading_mat_flipped,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "PCA Loadings of WMH Traits (PC1 Flipped)"
+)
+ 
+dev.off()
+```
+

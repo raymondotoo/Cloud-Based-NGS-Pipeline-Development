@@ -1,0 +1,184 @@
+---
+title: "06_ADNI_ADRC_ML"
+author: "Raymond Otoo"
+date: "2026-01-30"
+output: pdf_document
+---
+
+
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+ml_dir <- file.path(paths$results_dir, "ml")
+dir.create(ml_dir, recursive = TRUE, showWarnings = FALSE)
+getwd()
+```
+
+
+#=====================================================================================
+#
+# 1. Read saved object containing Traits and MEs
+#=====================================================================================
+```{r}
+#Load key results from Part A of ADNI Proteomics analysis
+load(file.path(paths$wgcna_dir, "03_output.RData"))
+```
+
+
+#=====================================================================================
+#
+#                                   2. ML implementation
+
+# 1. Feature Matrix Preparation
+#=====================================================================================
+```{r}
+# Ensure row alignment
+stopifnot(rownames(MEs) == rownames(traits))
+ 
+# Combine features + outcome
+ml_df <- data.frame(
+  MEs,
+  stroke = factor(traits$stroke)  # change outcome if needed
+)
+ 
+# Remove samples with missing outcome
+ml_df <- ml_df[!is.na(ml_df$stroke), ]
+```
+
+
+
+```{r}
+ml_df
+```
+
+
+
+```{r}
+
+#do once
+#install.packages("caret",dependencies = TRUE)
+```
+
+
+## 2. Train/test split(No leakage)
+```{r}
+set.seed(42)
+ 
+train_idx <- caret::createDataPartition(
+  ml_df$stroke,
+  p = 0.7,
+  list = FALSE
+)
+ 
+train_df <- ml_df[train_idx, ]
+test_df  <- ml_df[-train_idx, ]
+```
+
+```{r}
+train_df
+test_df
+```
+
+
+
+# 3. Feature scaling 
+```{r}
+preproc <- caret::preProcess(
+  train_df[, -ncol(train_df)],
+  method = c("center", "scale")
+)
+ 
+X_train <- predict(preproc, train_df[, -ncol(train_df)])
+X_test  <- predict(preproc, test_df[, -ncol(test_df)])
+ 
+y_train <- train_df$stroke
+y_test  <- test_df$stroke
+```
+
+
+
+# 4. Elastic Net(Primary Model)
+# * Handles correlated modules
+# * Sparse
+# * Interpretable
+# * Biological interpretable
+```{r}
+library(glmnet)
+ 
+x_mat <- as.matrix(X_train)
+y_vec <- y_train
+ 
+cv_fit <- cv.glmnet(
+  x = x_mat,
+  y = y_vec,
+  family = "binomial",
+  alpha = 0.5,          # Elastic Net
+  nfolds = 5
+)
+ 
+best_lambda <- cv_fit$lambda.min
+```
+
+#5. Evaluate on held-out test set
+```{r}
+# Predict probabilities
+test_probs <- predict(
+  cv_fit,
+  newx = as.matrix(X_test),
+  s = best_lambda,
+  type = "response"
+)
+ 
+# Convert to class labels
+test_pred <- ifelse(test_probs > 0.5, "1", "0")
+test_pred <- factor(test_pred, levels = levels(y_test))
+ 
+# Confusion matrix
+caret::confusionMatrix(test_pred, y_test)
+```
+#ROC
+```{r}
+library(pROC)
+ 
+roc_obj <- roc(
+  response = y_test,
+  predictor = as.numeric(test_probs)
+)
+ 
+auc(roc_obj)
+plot(roc_obj)
+```
+
+
+# 6. Interpret model
+```{r}
+coef_df <- as.data.frame(as.matrix(
+  coef(cv_fit, s = best_lambda)
+))
+ 
+coef_df$Module <- rownames(coef_df)
+colnames(coef_df)[1] <- "Coefficient"
+ 
+# Remove intercept
+coef_df <- coef_df[coef_df$Module != "(Intercept)", ]
+ 
+# Rank important modules
+coef_df <- coef_df[order(abs(coef_df$Coefficient), decreasing = TRUE), ]
+coef_df 
+head(coef_df)
+```
+
+# 7 . Map back the hub proteins( biological grounding)
+```{r}
+top_module <- gsub("ME", "", coef_df$Module[1])
+ 
+hubGenes <- names(expr)[moduleColors == top_module]
+head(hubGenes)
+
+top_module
+hubGenes
+```

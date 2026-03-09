@@ -1,0 +1,208 @@
+---
+title: "06_ADNI_ADRC_ML (fixed)"
+author: "automated-patch"
+date: "2026-03-04"
+output: pdf_document
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+
+# Ensure results directory exists
+results_dir <- file.path(base_dir, "results", "ml")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Libraries
+
+```{r libs, message=FALSE, warning=FALSE}
+pkgs <- c("caret", "glmnet", "pROC", "dplyr", "here")
+# Check for missing packages and install them
+missing_pkgs <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if(length(missing_pkgs) > 0){
+  message("Installing missing packages: ", paste(missing_pkgs, collapse=", "))
+  install.packages(missing_pkgs, dependencies = TRUE, repos = "https://cloud.r-project.org")
+}
+
+# Now, load all packages
+lapply(pkgs, library, character.only = TRUE)
+
+```
+
+# Load Data
+
+```{r load-data}
+# Load WGCNA outputs
+# Expecting 03_output.RData in results/wgcna/ (from step 03)
+wgcna_file <- file.path(base_dir, "results", "wgcna", "03_output.RData")
+
+if(!file.exists(wgcna_file)){
+  # Fallback to root results if not in wgcna subdir (legacy compatibility)
+  wgcna_file_legacy <- file.path(base_dir, "results", "03_output.RData")
+  if(file.exists(wgcna_file_legacy)){
+    wgcna_file <- wgcna_file_legacy
+  } else {
+    stop("WGCNA output file not found. Expected at: ", wgcna_file)
+  }
+}
+message("Loading: ", wgcna_file)
+load(wgcna_file)
+
+# Check objects
+req_objs <- c("MEs", "traits", "expr", "moduleColors")
+missing_objs <- setdiff(req_objs, ls())
+if(length(missing_objs) > 0) stop("Missing objects in loaded RData: ", paste(missing_objs, collapse=", "))
+```
+
+# Feature Matrix Preparation
+
+```{r prep-data}
+# Align samples
+common_samples <- intersect(rownames(MEs), rownames(traits))
+if(length(common_samples) == 0) stop("No common samples between MEs and traits.")
+
+MEs <- MEs[common_samples, , drop=FALSE]
+traits <- traits[common_samples, , drop=FALSE]
+expr <- expr[common_samples, , drop=FALSE]
+
+# Define target
+target_col <- "stroke" 
+if(!target_col %in% colnames(traits)) stop("Target column '", target_col, "' not found in traits.")
+
+# Combine features + outcome
+ml_df <- data.frame(
+  MEs,
+  outcome = factor(traits[[target_col]])
+)
+
+# Remove samples with missing outcome
+ml_df <- ml_df[!is.na(ml_df$outcome), ]
+message("Samples for ML: ", nrow(ml_df))
+message("Outcome distribution:")
+print(table(ml_df$outcome))
+
+# Ensure at least 2 classes
+if(length(unique(ml_df$outcome)) < 2) stop("Outcome has fewer than 2 classes.")
+```
+
+# Train/Test Split
+
+```{r split}
+set.seed(42)
+train_idx <- createDataPartition(ml_df$outcome, p = 0.7, list = FALSE)
+train_df <- ml_df[train_idx, ]
+test_df  <- ml_df[-train_idx, ]
+```
+
+# Feature Scaling
+
+```{r scaling}
+# Preprocess (center/scale) based on training data
+preproc <- preProcess(train_df %>% select(-outcome), method = c("center", "scale"))
+
+X_train <- predict(preproc, train_df %>% select(-outcome))
+X_test  <- predict(preproc, test_df %>% select(-outcome))
+
+y_train <- train_df$outcome
+y_test  <- test_df$outcome
+```
+
+# Elastic Net Model
+
+```{r model}
+# glmnet requires numeric 0/1 outcome for binomial when y is not a two-column matrix
+y01 <- as.numeric(y_train == levels(y_train)[2])
+
+# CV for lambda
+cv_fit <- cv.glmnet(
+  x = as.matrix(X_train),
+  y = y01,
+  family = "binomial",
+  alpha = 0.5, # Elastic Net
+  nfolds = 5,
+  standardize = FALSE # already centered/scaled via caret preProcess
+)
+
+best_lambda <- cv_fit$lambda.min
+message("Best Lambda: ", best_lambda)
+plot(cv_fit)
+```
+
+# Evaluation
+
+```{r evaluation}
+# Predict probabilities
+test_probs <- as.numeric(predict(cv_fit, newx = as.matrix(X_test), s = best_lambda, type = "response"))
+
+# Convert to class labels (threshold 0.5)
+levels_y <- levels(y_test)
+test_pred_class <- ifelse(test_probs > 0.5, levels_y[2], levels_y[1])
+test_pred_factor <- factor(test_pred_class, levels = levels_y)
+
+# Confusion Matrix
+cm <- confusionMatrix(test_pred_factor, y_test, positive = levels_y[2])
+print(cm)
+
+# ROC (ensure response is a factor with expected ordering)
+roc_obj <- roc(response = y_test, predictor = test_probs, levels = levels_y, direction = "<", quiet = TRUE)
+auc_val <- as.numeric(auc(roc_obj))
+message("AUC: ", auc_val)
+
+png(file.path(results_dir, "ROC_Curve.png"))
+plot(roc_obj, main = paste0("ROC Curve (AUC = ", round(auc_val, 3), ")"))
+dev.off()
+```
+
+# Interpretation
+
+```{r interpretation}
+# Extract coefficients
+coef_mat <- coef(cv_fit, s = best_lambda)
+
+coef_df <- data.frame(
+  Module = rownames(coef_mat),
+  Coefficient = as.numeric(coef_mat),
+  row.names = NULL,
+  stringsAsFactors = FALSE
+)
+
+# Remove intercept and filter non-zero
+coef_df <- coef_df %>%
+  filter(Module != "(Intercept)", Coefficient != 0) %>%
+  arrange(desc(abs(Coefficient)))
+
+print(coef_df)
+write.csv(coef_df, file.path(results_dir, "Model_Coefficients.csv"), row.names = FALSE)
+
+# Map top module to proteins (moduleColors contains per-protein module assignment; values are colors)
+if (nrow(coef_df) > 0) {
+  top_module <- coef_df$Module[1]
+
+  if (!startsWith(top_module, "ME")) {
+    message("Top feature is not a module eigengene (expected prefix 'ME'): ", top_module)
+  } else {
+    top_color <- sub("^ME", "", top_module)
+    message("Top Module Color: ", top_color)
+
+    if (top_color %in% unique(moduleColors)) {
+      proteins_in_top <- colnames(expr)[moduleColors == top_color]
+      message("Number of proteins in top module: ", length(proteins_in_top))
+      print(utils::head(proteins_in_top))
+
+      write.csv(
+        data.frame(Protein = proteins_in_top),
+        file.path(results_dir, paste0("Proteins_in_", top_color, ".csv")),
+        row.names = FALSE
+      )
+    } else {
+      message("Module color not found in moduleColors values: ", top_color)
+    }
+  }
+} else {
+  message("No non-zero coefficients found.")
+}
+```

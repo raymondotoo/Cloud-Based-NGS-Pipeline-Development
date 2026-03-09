@@ -1,0 +1,161 @@
+---
+title: "02a_ADNI_ADRC_harmonized (fixed)"
+author: "automated-patch"
+date: "2026-03-05"
+output: pdf_document
+---
+
+# 1. Setup
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+
+# Ensure directories exist
+results_dir <- file.path(base_dir, "results")
+plots_dir <- file.path(results_dir, "plots")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r libs, message=FALSE, warning=FALSE}
+pkgs <- c("sva", "limma", "openxlsx", "dplyr", "ggplot2", "ggrepel")
+
+# Install missing packages
+for(pk in pkgs){
+  if(!requireNamespace(pk, quietly = TRUE)){
+    message("Installing missing package: ", pk)
+    if(pk %in% c("sva", "limma")){
+      if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(pk, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pk)
+    }
+  }
+}
+
+lapply(pkgs, library, character.only = TRUE)
+options(stringsAsFactors = FALSE)
+```
+
+# 2. Load Data
+
+```{r load-data}
+# Load data from results directory (assumed output from step 00)
+pheno_file <- file.path(results_dir, "PhenoInfo_numeric.xlsx")
+proto_file <- file.path(results_dir, "ProtoData_filtered.xlsx")
+
+if(!file.exists(pheno_file)) stop("Phenotype file not found: ", pheno_file)
+if(!file.exists(proto_file)) stop("Proteomics file not found: ", proto_file)
+
+PhenoInfo_numeric <- read.xlsx(pheno_file)
+ProtoData_filtered <- read.xlsx(proto_file)
+
+# Clean SampleIDs
+ProtoData_filtered <- ProtoData_filtered %>%
+  rename(SampleID = 1) %>%
+  mutate(SampleID = trimws(SampleID))
+ 
+PhenoInfo_numeric <- PhenoInfo_numeric %>%
+  rename(SampleID = 1) %>%
+  mutate(SampleID = trimws(SampleID))
+
+# Set Row Names for phenotype
+rownames(PhenoInfo_numeric) <- PhenoInfo_numeric$SampleID
+PhenoInfo_numeric <- PhenoInfo_numeric %>% select(-SampleID)
+
+# Ensure Cohort is a factor for ComBat
+if("Cohort" %in% colnames(PhenoInfo_numeric)){
+  PhenoInfo_numeric$Cohort <- as.factor(PhenoInfo_numeric$Cohort)
+} else {
+  stop("Column 'Cohort' missing from phenotype data.")
+}
+```
+
+# 3. Prepare Expression Matrix
+
+```{r prep-matrix}
+# Convert to strictly numeric matrix (ComBat requirement)
+# Remove non-numeric columns (SampleID, drawDate, Panel.OLINK if present)
+cols_to_remove <- c("SampleID", "drawDate", "Panel.OLINK")
+expr_data_for_matrix <- ProtoData_filtered %>% select(-any_of(cols_to_remove))
+
+expr_matrix <- as.matrix(sapply(expr_data_for_matrix, as.numeric))
+rownames(expr_matrix) <- ProtoData_filtered$SampleID 
+ 
+# Transpose (Proteins as Rows, Samples as Columns for ComBat)
+expr_matrix_transposed <- t(expr_matrix)
+
+# Handle NAs: Remove proteins that are all NA
+all_na_rows <- which(rowSums(is.na(expr_matrix_transposed)) == ncol(expr_matrix_transposed))
+if(length(all_na_rows) > 0) {
+    expr_matrix_clean <- expr_matrix_transposed[-all_na_rows, ]
+    message(paste("Removed", length(all_na_rows), "proteins that were all NA."))
+} else {
+    expr_matrix_clean <- expr_matrix_transposed
+}
+```
+
+# 4. Alignment and Batch Correction (ComBat)
+
+```{r combat}
+# --- CRITICAL ALIGNMENT ---
+# 1. Define the exact order of samples from the clean matrix
+sample_order <- colnames(expr_matrix_clean)
+
+# 2. Use match() to find the index of these samples in the phenotype data
+match_index <- match(sample_order, rownames(PhenoInfo_numeric))
+if(any(is.na(match_index))) stop("Some samples in expression data not found in phenotype data.")
+
+# 3. Create the phenotype data frame and batch vector in the correct, guaranteed order
+pheno_combat <- PhenoInfo_numeric[match_index, ]
+batch_vector <- pheno_combat$Cohort 
+
+# Null Model: Adjust only for the batch variable (Cohort)
+mod_null <- model.matrix(~1, data = pheno_combat)
+
+# PCA Before Correction
+pca_before <- prcomp(t(expr_matrix_clean), scale. = TRUE)
+pca_df_before <- data.frame(
+  PC1 = pca_before$x[, 1],
+  PC2 = pca_before$x[, 2],
+  Cohort = pheno_combat$Cohort
+)
+
+p_before <- ggplot(pca_df_before, aes(PC1, PC2, color = Cohort)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_bw(base_size = 14) +
+  ggtitle("PCA Before ComBat") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(filename = file.path(plots_dir, "PCA_Before_Batch_Correction.png"), plot = p_before, width = 8, height = 6)
+
+# Run ComBat
+combat_adjusted_matrix <- ComBat(
+    dat = expr_matrix_clean, 
+    batch = batch_vector, 
+    mod = mod_null,
+    par.prior = TRUE, 
+    prior.plots = FALSE 
+)
+
+# Transpose back (Samples as Rows, Proteins as Columns)
+Proto_Combat_Adjusted <- as.data.frame(t(combat_adjusted_matrix))
+
+# Assign to final variable name expected by downstream scripts
+Proto_combat_z <- Proto_Combat_Adjusted 
+```
+
+# 5. Save Results
+
+```{r save}
+# Save Excel output
+write.xlsx(Proto_combat_z, file.path(results_dir, "ADNI_ADRC_Proteomics_Combat_Adjusted_Zscored.xlsx"), rowNames = TRUE)
+
+# Save RData for WGCNA step
+# IMPORTANT: Must save 'pheno_combat' and 'Proto_combat_z'
+save(pheno_combat, Proto_combat_z, file = file.path(results_dir, "02_output.RData"))
+
+message("Harmonization complete. Saved 02_output.RData to ", results_dir)
+```

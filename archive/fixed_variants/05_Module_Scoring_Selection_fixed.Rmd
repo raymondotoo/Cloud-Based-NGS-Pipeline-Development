@@ -1,0 +1,176 @@
+---
+title: "05_Module_Scoring_Selection (fixed)"
+author: "automated-patch"
+date: "2026-03-04"
+output: pdf_document
+---
+
+# Setup and Configuration
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+
+# Ensure results directory exists
+results_dir <- file.path(base_dir, "results", "network_annotation")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load Libraries
+
+```{r libs, message=FALSE, warning=FALSE}
+pkgs <- c("dplyr", "tibble", "here", "readr")
+# Check for missing packages and install them
+missing_pkgs <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if(length(missing_pkgs) > 0){
+  message("Installing missing packages: ", paste(missing_pkgs, collapse=", "))
+  install.packages(missing_pkgs, dependencies = TRUE, repos = "https://cloud.r-project.org")
+}
+
+# Now, load all packages
+for(pk in pkgs){
+  if(!pk %in% .packages()){
+    library(pk, character.only = TRUE)
+  }
+}
+options(stringsAsFactors = FALSE)
+```
+
+# Load WGCNA Data
+
+```{r load-data}
+# Load key results from WGCNA step
+wgcna_file <- file.path(base_dir, "results", "wgcna", "WGCNA2_core_outputs.RData")
+if (!file.exists(wgcna_file)) stop("WGCNA output file not found: ", wgcna_file)
+
+load(wgcna_file)
+
+# Check that necessary objects are loaded
+if (!exists("moduleTraitCor") || !exists("moduleTraitP")) {
+  stop("Required objects 'moduleTraitCor' or 'moduleTraitP' not found in RData file.")
+}
+
+cor_mat <- moduleTraitCor
+pval_mat <- moduleTraitP
+```
+
+# Define Trait Groups and Parameters
+
+```{r define-trait-groups}
+# Biologically motivated trait groups
+vascular_traits <- c("PC1", "fsrp", "htnscore", "SBP", "d_cmb", "lacunar_stroke")
+caa_traits <- c("caa_prob", "caa")
+ad_traits <- c("AD_status", "E4status", "cog_status")
+
+# Verify that all specified traits exist in the correlation matrix
+all_defined_traits <- unique(c(vascular_traits, caa_traits, ad_traits))
+missing_traits <- setdiff(all_defined_traits, colnames(cor_mat))
+if (length(missing_traits) > 0) {
+  stop("The following traits are defined but not found in the data: ", paste(missing_traits, collapse = ", "))
+}
+
+# Thresholds for discrete scoring
+r_thresh <- 0.12
+q_thresh <- 0.05
+```
+
+# Calculate FDR-Corrected P-values
+
+```{r fdr-correction}
+# Create a matrix to hold FDR-corrected p-values (q-values)
+qval_mat <- pval_mat
+for (trait in colnames(pval_mat)) {
+  qval_mat[, trait] <- p.adjust(pval_mat[, trait], method = "BH")
+}
+```
+
+# Method 1: Discrete Scoring (Hit Counting)
+
+```{r discrete-scoring}
+score_discrete <- function(trait_set, direction = c("two_sided", "positive", "negative")) {
+  direction <- match.arg(direction)
+  sapply(rownames(cor_mat), function(mod) {
+    r_vec <- as.numeric(cor_mat[mod, trait_set])
+    q_vec <- as.numeric(qval_mat[mod, trait_set])
+    
+    if (direction == "two_sided") {
+      sum(abs(r_vec) >= r_thresh & q_vec < q_thresh, na.rm = TRUE)
+    } else if (direction == "positive") {
+      sum(r_vec >= r_thresh & q_vec < q_thresh, na.rm = TRUE)
+    } else {
+      sum(r_vec <= -r_thresh & q_vec < q_thresh, na.rm = TRUE)
+    }
+  })
+}
+
+module_scores_discrete <- data.frame(
+  module = rownames(cor_mat),
+  vascular_hits = score_discrete(vascular_traits, direction = "positive"),
+  caa_hits = score_discrete(caa_traits, direction = "positive"),
+  ad_hits_pos = score_discrete(ad_traits, direction = "positive"),
+  ad_hits_neg = score_discrete(ad_traits, direction = "negative")
+)
+
+# Assign labels based on hit counts
+module_scores_discrete$label_discrete <- "none"
+module_scores_discrete$label_discrete[module_scores_discrete$vascular_hits >= 2] <- "vascular"
+module_scores_discrete$label_discrete[module_scores_discrete$caa_hits >= 1] <- "CAA"
+module_scores_discrete$label_discrete[module_scores_discrete$ad_hits_neg >= 1] <- "protective_healthy"
+```
+
+# Method 2: Continuous Scoring (Magnitude-based)
+
+```{r continuous-scoring}
+score_continuous <- function(trait_set) {
+  sapply(rownames(cor_mat), function(mod) {
+    r_vec <- as.numeric(cor_mat[mod, trait_set])
+    q_vec <- as.numeric(qval_mat[mod, trait_set])
+    # Sum the absolute correlation values for only the significant traits
+    sum(abs(r_vec[q_vec < q_thresh]), na.rm = TRUE)
+  })
+}
+
+module_scores_continuous <- data.frame(
+  module = rownames(cor_mat),
+  vascular_score = score_continuous(vascular_traits),
+  caa_score = score_continuous(caa_traits),
+  ad_score = score_continuous(ad_traits)
+)
+
+# Standardize scores (z-scores) for comparison
+module_scores_continuous <- module_scores_continuous %>%
+  mutate(
+    vascular_z = scale(vascular_score)[, 1],
+    caa_z = scale(caa_score)[, 1],
+    ad_z = scale(ad_score)[, 1]
+  )
+
+# Assign a label based on the domain with the highest absolute z-score
+module_scores_continuous$label_continuous <- apply(
+  module_scores_continuous[, c("vascular_z", "caa_z", "ad_z")],
+  1,
+  function(x) {
+    if (all(x == 0)) return("none")
+    domains <- c("vascular", "CAA", "AD")
+    domains[which.max(abs(x))]
+  }
+)
+```
+
+# Combine and Save Results
+
+```{r save-results}
+# Join the results from both scoring methods into a single table
+final_comparison_table <- module_scores_discrete %>%
+  left_join(module_scores_continuous, by = "module")
+
+print("Combined Module Scoring Results:")
+print(final_comparison_table)
+
+# Save the final table to a CSV file
+output_file <- file.path(results_dir, "Module_Trait_Scoring_Combined.csv")
+write_csv(final_comparison_table, output_file)
+
+message("Module scoring table saved to: ", output_file)
+```

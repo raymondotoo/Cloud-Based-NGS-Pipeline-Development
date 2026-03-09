@@ -1,0 +1,302 @@
+---
+title: "07b_Functional_Analysis_ORA (fixed)"
+author: "automated-patch"
+date: "2026-03-05"
+output: pdf_document
+---
+
+# 1. Setup
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+
+# Ensure directories exist
+results_dir <- file.path(base_dir, "results", "functional_analysis_ora")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r libs, message=FALSE, warning=FALSE}
+pkgs <- c("WGCNA", "dplyr", "readr", "clusterProfiler", "org.Hs.eg.db", 
+          "enrichplot", "ReactomePA", "ggplot2", "openxlsx", "stringr")
+
+# Install missing packages first
+for(pk in pkgs){
+  if(!requireNamespace(pk, quietly = TRUE)){
+    message("Installing missing package: ", pk)
+    if(pk %in% c("WGCNA", "clusterProfiler", "org.Hs.eg.db", "enrichplot", "ReactomePA")){
+      if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(pk, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pk)
+    }
+  }
+}
+
+# Load packages after ensuring all are installed
+lapply(pkgs, library, character.only = TRUE)
+options(stringsAsFactors = FALSE)
+```
+
+# 2. Load Data
+
+```{r load-data}
+# Load WGCNA outputs
+wgcna_file <- file.path(base_dir, "results", "wgcna", "WGCNA2_core_outputs.RData")
+if(!file.exists(wgcna_file)) stop("WGCNA output not found at: ", wgcna_file)
+load(wgcna_file)
+
+# Check loaded objects
+if(!exists("expr") || !exists("moduleColors")) stop("WGCNA objects 'expr' or 'moduleColors' missing.")
+stopifnot(colnames(expr) == names(moduleColors))
+
+# Load Annotation
+analyte_file <- file.path(base_dir, "data", "CSF_SOMAscan7k_analyte_information.tsv")
+if(!file.exists(analyte_file)) stop("Analyte annotation not found: ", analyte_file)
+analyte_info <- read.delim(analyte_file, sep = "\t", header = TRUE, check.names = FALSE)
+```
+
+# 3. ID Mapping (SOMAmer -> SYMBOL -> ENTREZ)
+
+```{r id-mapping}
+all_features <- colnames(expr)
+
+feature_key <- analyte_info %>%
+  dplyr::filter(Analytes %in% all_features) %>%
+  dplyr::select(Analytes, EntrezGeneSymbol) %>%
+  dplyr::distinct() %>%
+  dplyr::rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+
+# Map to Entrez
+map_all <- bitr(
+  feature_key$SYMBOL,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE)
+
+feature_map <- feature_key %>%
+  dplyr::inner_join(map_all, by = "SYMBOL")
+
+# Universe background
+universe_entrez <- unique(feature_map$ENTREZID)
+message("Mapped ", length(universe_entrez), " unique Entrez IDs from ", length(all_features), " SOMAmers.")
+```
+
+# 4. ORA Execution
+
+```{r ora-functions}
+modules_to_export <- setdiff(unique(moduleColors), "grey")
+
+get_module_entrez <- function(mod) {
+  somamers <- colnames(expr)[moduleColors == mod]
+  feature_map %>%
+    filter(SOMAmer %in% somamers) %>%
+    pull(ENTREZID) %>%
+    unique()
+}
+
+run_ORA_GO_BP <- function(entrez) {
+  enrichGO(
+    gene          = entrez,
+    universe      = universe_entrez,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "ENTREZID",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff  = 0.1,
+    readable      = TRUE
+  )
+}
+
+run_ORA_KEGG <- function(entrez) {
+  enrichKEGG(
+    gene          = entrez,
+    universe      = universe_entrez,
+    organism      = "hsa",
+    pAdjustMethod = "BH",
+    qvalueCutoff  = 0.1
+  )
+}
+
+run_ORA_Reactome <- function(entrez) {
+  enrichPathway(
+    gene          = entrez,
+    universe      = universe_entrez,
+    organism      = "human",
+    pAdjustMethod = "BH",
+    qvalueCutoff  = 0.1,
+    readable      = TRUE
+  )
+}
+```
+
+```{r run-ora}
+ora_results <- list(
+  GO_BP   = list(),
+  KEGG    = list(),
+  Reactome = list()
+)
+
+for (mod in modules_to_export) {
+  message("Running ORA for module: ", mod)
+  entrez <- get_module_entrez(mod)
+  if (length(entrez) < 10) {
+    message("  -> Skipping, fewer than 10 mapped genes.")
+    next
+  }
+  ora_results$GO_BP[[mod]]    <- run_ORA_GO_BP(entrez)
+  ora_results$KEGG[[mod]]     <- run_ORA_KEGG(entrez)
+  ora_results$Reactome[[mod]] <- run_ORA_Reactome(entrez)
+}
+```
+
+# 5. Save Results
+
+```{r save-ora-results}
+save_ORA_results <- function(results_object, outdir, padj_cutoff = 0.05) {
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  for (db in names(results_object)) {
+    wb <- createWorkbook()
+    message("Creating workbook for: ", db)
+    modules_list <- results_object[[db]]
+    
+    for (mod in names(modules_list)) {
+      res <- modules_list[[mod]]
+      if (is.null(res) || nrow(as.data.frame(res)) == 0) next
+
+      df <- as.data.frame(res) %>% filter(p.adjust < padj_cutoff)
+      if (nrow(df) == 0) next
+
+      if ("geneID" %in% colnames(df)) {
+        df$geneID <- sapply(strsplit(df$geneID, "/"), paste, collapse = ", ")
+      }
+
+      addWorksheet(wb, mod)
+      writeData(wb, mod, df)
+    }
+
+    if (length(wb$worksheets) > 0) {
+      file_path <- file.path(outdir, paste0("ORA_", db, "_Results.xlsx"))
+      saveWorkbook(wb, file = file_path, overwrite = TRUE)
+      message("  -> Saved: ", file_path)
+    } else {
+      message("  -> No significant pathways to save for ", db)
+    }
+  }
+}
+
+save_ORA_results(ora_results, results_dir)
+```
+
+# 6. Visualization
+
+```{r plot-ora-dotplots}
+plot_ORA_dotplot <- function(ora_object, module_name, database = "GO_BP", top_n = 15, padj_cutoff = 0.05) {
+  res <- ora_object[[database]][[module_name]]
+  if (is.null(res)) return(NULL)
+
+  df <- as.data.frame(res) %>%
+    filter(p.adjust < padj_cutoff) %>%
+    arrange(p.adjust) %>%
+    head(top_n)
+  if (nrow(df) == 0) return(NULL)
+
+  df$GeneRatioNumeric <- sapply(df$GeneRatio, function(x) eval(parse(text = x)))
+  df$Description <- str_wrap(df$Description, width = 50)
+
+  p <- ggplot(df, aes(x = GeneRatioNumeric, y = reorder(Description, GeneRatioNumeric))) +
+    geom_point(aes(size = Count, color = -log10(p.adjust))) +
+    scale_color_viridis_c(option = "plasma") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste(database, "Enrichment – Module", module_name),
+      x = "Gene Ratio", y = NULL,
+      color = "-log10(adj.p)", size = "Gene Count"
+    )
+  return(p)
+}
+
+# Save all dotplots
+plots_dir <- file.path(results_dir, "plots")
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (db in names(ora_results)) {
+  for (mod in names(ora_results[[db]])) {
+    p <- plot_ORA_dotplot(ora_results, module_name = mod, database = db)
+    if (!is.null(p)) {
+      ggsave(
+        filename = file.path(plots_dir, paste0(db, "_", mod, "_dotplot.png")),
+        plot = p, width = 8, height = 6, dpi = 300
+      )
+    }
+  }
+}
+```
+
+# 7. Hub Gene Extraction
+
+```{r hub-gene-extraction}
+# Recompute kME for hub gene analysis
+datKME <- as.data.frame(cor(expr, MEs, use = "p"))
+colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
+rownames(datKME) <- colnames(expr)
+
+extract_hub_genes_per_pathway <- function(module_name, database = "GO_BP", kME_threshold = 0.7, padj_cutoff = 0.05) {
+  ora_res <- ora_results[[database]][[module_name]]
+  if (is.null(ora_res)) return(NULL)
+
+  df <- as.data.frame(ora_res) %>% filter(p.adjust < padj_cutoff)
+  if (nrow(df) == 0) return(NULL)
+
+  kme_col <- paste0("kME_", module_name)
+  module_genes <- feature_map %>%
+    filter(SOMAmer %in% colnames(expr)[moduleColors == module_name]) %>%
+    left_join(
+      data.frame(SOMAmer = rownames(datKME), kME = datKME[, kme_col]),
+      by = "SOMAmer"
+    ) %>%
+    filter(abs(kME) >= kME_threshold)
+
+  pathway_list <- list()
+  for (i in 1:nrow(df)) {
+    pathway_name <- df$Description[i]
+    pathway_genes <- unlist(strsplit(df$geneID[i], "/"))
+    hubs <- module_genes %>%
+      filter(SYMBOL %in% pathway_genes) %>%
+      arrange(desc(kME))
+    if (nrow(hubs) > 0) {
+      pathway_list[[pathway_name]] <- hubs %>% select(SOMAmer, SYMBOL, ENTREZID, kME)
+    }
+  }
+  return(pathway_list)
+}
+
+# Save hub genes to Excel
+hub_dir <- file.path(results_dir, "HubGenes")
+dir.create(hub_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (mod in modules_to_export) {
+  hub_data <- extract_hub_genes_per_pathway(module_name = mod, database = "GO_BP")
+  if (is.null(hub_data) || length(hub_data) == 0) next
+
+  wb <- createWorkbook()
+  for (pathway in names(hub_data)) {
+    # Sanitize sheet name
+    sheet_name <- substr(gsub("[:\\\\/?*\\[\\]]", "", pathway), 1, 31)
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, hub_data[[pathway]])
+  }
+  
+  if(length(wb$worksheets) > 0) {
+      saveWorkbook(
+        wb,
+        file = file.path(hub_dir, paste0("HubGenes_GO_BP_", mod, ".xlsx")),
+        overwrite = TRUE
+      )
+  }
+}
+```

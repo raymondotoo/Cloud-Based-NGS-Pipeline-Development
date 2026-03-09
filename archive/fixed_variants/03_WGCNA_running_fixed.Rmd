@@ -1,0 +1,253 @@
+---
+title: "WGCNA (fixed)"
+author: "automated-patch"
+date: "2026-03-04"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+data_dir <- file.path(base_dir, "data")
+results_dir <- file.path(base_dir, "results", "wgcna")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r libs}
+pkgs <- c("WGCNA", "dynamicTreeCut", "openxlsx", "dplyr")
+for(pk in pkgs){
+  if(!suppressWarnings(require(pk, character.only = TRUE))){
+    message(sprintf("Installing missing package '%s' from CRAN/Bioconductor (may require BiocManager).", pk))
+    if(pk %in% c("WGCNA","dynamicTreeCut")){
+      if(!suppressWarnings(require("BiocManager", character.only = TRUE))) install.packages("BiocManager", repos = "https://cloud.r-project.org")
+      BiocManager::install(pk, ask = FALSE)
+    } else {
+      install.packages(pk, repos = "https://cloud.r-project.org")
+    }
+    if(!suppressWarnings(require(pk, character.only = TRUE))){
+      stop(sprintf("Failed to install required package '%s'", pk))
+    }
+  }
+}
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+```
+
+```{r load-data}
+# Expect prior output RData at Proteomics/results/02_output.RData
+prior_rdata <- file.path(base_dir, "results", "02_output.RData")
+if(!file.exists(prior_rdata)) stop("Required file not found: ", prior_rdata)
+load(prior_rdata)
+# Expect objects: Proto_combat_z (expr), pheno_combat (traits)
+if(!exists("Proto_combat_z") || !exists("pheno_combat")) stop("Loaded RData does not contain expected objects 'Proto_combat_z' and 'pheno_combat'")
+
+expr <- Proto_combat_z
+traits <- pheno_combat
+
+# If PCA scores are available as a CSV, merge PC1-PC3 into phenotype by SampleID
+pc_file <- file.path(base_dir, "data", "WMH_PCA_scores_PC1_PC3.csv")
+if(file.exists(pc_file)){
+  message("Found PCA scores file: ", pc_file, " — merging PC1-PC3 into phenotype")
+  pc_df <- read.csv(pc_file, stringsAsFactors = FALSE)
+  # Ensure SampleID column exists
+  if(!"SampleID" %in% colnames(pc_df)){
+    message("PCA scores file lacks 'SampleID' column; attempting to use first column as SampleID")
+    colnames(pc_df)[1] <- "SampleID"
+  }
+  # Deduplicate PCA rows by SampleID (keep first)
+  if(any(duplicated(pc_df$SampleID))){
+    dup_count <- sum(duplicated(pc_df$SampleID))
+    message("Warning: PCA scores file contains ", dup_count, " duplicate SampleID rows — keeping first occurrence")
+    pc_df <- pc_df[!duplicated(pc_df$SampleID), ]
+  }
+  # Match and merge
+  matched <- match(rownames(traits), pc_df$SampleID)
+  missing_pc <- sum(is.na(matched))
+  if(missing_pc>0) message("Warning: ", missing_pc, " phenotype samples had no matching PCA row")
+  # Add PC columns if present
+  for(pc in c("PC1","PC2","PC3")){
+    if(pc %in% colnames(pc_df)){
+      traits[[pc]] <- pc_df[[pc]][matched]
+    } else {
+      message("PCA scores file missing column: ", pc)
+    }
+  }
+  write.csv(data.frame(n_pc_rows = nrow(pc_df), n_matched = sum(!is.na(matched)), n_unmatched = missing_pc), file = file.path(results_dir, "pca_merge_diagnostics.csv"), row.names = FALSE)
+} else {
+  message("PCA scores file not found at: ", pc_file)
+}
+
+# Ensure samples overlap and match safely
+
+# Detect orientation: WGCNA expects samples as rows and genes/proteins as columns.
+# Many upstream scripts store expression as proteins x samples (rows=proteins, cols=samples).
+if(!is.null(rownames(traits)) && !is.null(colnames(expr)) && all(rownames(traits) %in% colnames(expr)) && !all(rownames(traits) %in% rownames(expr))){
+  message("Detected samples in columns of expression matrix; transposing to samples x proteins")
+  expr <- t(expr)
+}
+
+# Now match by sample IDs (rownames of traits and rows of expr)
+common_samples <- intersect(rownames(traits), rownames(expr))
+if(length(common_samples) == 0) stop("No matching sample IDs between phenotype and expression data after orientation check")
+if(length(common_samples) < nrow(traits)) message("Warning: Some phenotype samples lack expression data; proceeding with intersection of ", length(common_samples), " samples")
+expr <- expr[common_samples, , drop = FALSE]
+traits <- traits[common_samples, , drop = FALSE]
+
+write.csv(data.frame(n_samples = nrow(expr), n_proteins = ncol(expr)), file = file.path(results_dir, "wgcna_input_dimensions.csv"), row.names = FALSE)
+```
+
+```{r qc}
+# goodSamplesGenes check
+gsg <- goodSamplesGenes(expr, verbose = 3)
+if(!gsg$allOK){
+  # write diagnostics
+  bad_samples <- if(!is.null(gsg$goodSamples)) which(!gsg$goodSamples) else integer(0)
+  bad_genes <- if(!is.null(gsg$goodGenes)) which(!gsg$goodGenes) else integer(0)
+  write.csv(data.frame(bad_samples = bad_samples), file = file.path(results_dir, "wgcna_bad_samples.csv"), row.names = FALSE)
+  write.csv(data.frame(bad_genes = bad_genes), file = file.path(results_dir, "wgcna_bad_genes.csv"), row.names = FALSE)
+  message("Removed bad samples/genes; continuing with filtered data")
+  expr <- expr[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+  traits <- traits[gsg$goodSamples, , drop = FALSE]
+}
+write.csv(data.frame(n_samples_after = nrow(expr), n_proteins_after = ncol(expr)), file = file.path(results_dir, "wgcna_postQC_dimensions.csv"), row.names = FALSE)
+```
+
+```{r sample-clustering}
+# sample clustering + outlier detection
+sampleTree <- hclust(dist(expr), method = "average")
+png(file.path(results_dir, "sample_clustering.png"), width = 1600, height = 1200, res = 200)
+plot(sampleTree, main = "Sample clustering", sub = "", xlab = "")
+dev.off()
+```
+
+```{r soft-threshold}
+# Ensure enough samples and variance
+if(nrow(expr) < 15) message("Warning: fewer than 15 samples; pickSoftThreshold may produce unstable results")
+powers <- c(1:20)
+sft <- pickSoftThreshold(expr, powerVector = powers, verbose = 5)
+png(file.path(results_dir, "SoftThreshold_ScaleFreeTopology.png"), width = 2000, height = 1500, res = 300)
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit (signed R²)", type = "n", main = "Scale independence")
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels = powers, col = "red")
+abline(h = 0.85, col = "blue", lty = 2)
+dev.off()
+png(file.path(results_dir, "SoftThreshold_MeanConnectivity.png"), width = 2000, height = 1500, res = 300)
+plot(sft$fitIndices[,1], sft$fitIndices[,5], xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", type = "n", main = "Mean connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels = powers, col = "red")
+dev.off()
+# choose a sensible default or let user override
+softPower <- if(exists("softPower")) softPower else 6
+message("Using softPower = ", softPower)
+```
+
+```{r network-construction}
+adjacency <- adjacency(expr, power = softPower, type = "signed hybrid")
+TOM <- TOMsimilarity(adjacency, TOMType = "signed")
+dissTOM <- 1 - TOM
+geneTree <- hclust(as.dist(dissTOM), method = "average")
+png(file.path(results_dir, "Gene_dendrogram.png"), width = 2000, height = 1500, res = 300)
+plot(geneTree, main = "Protein clustering on TOM-based dissimilarity", xlab = "", sub = "")
+dev.off()
+```
+
+```{r module-detection}
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM, deepSplit = 3, pamRespectsDendro = FALSE, minClusterSize = 30)
+dynamicColors <- labels2colors(dynamicMods)
+png(file.path(results_dir, "GeneDendrogram_DynamicModules.png"), width = 2000, height = 1500, res = 300)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut", dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+MElist <- moduleEigengenes(expr, colors = dynamicColors)
+MEs <- MElist$eigengenes
+MEDiss <- 1 - cor(MEs)
+METree <- hclust(as.dist(MEDiss), method = "average")
+png(file.path(results_dir, "Eigengene_clustering.png"), width = 2000, height = 1500, res = 300)
+plot(METree, main = "Clustering of module eigengenes")
+abline(h = 0.30, col = "red")
+dev.off()
+
+merge <- mergeCloseModules(expr, dynamicColors, cutHeight = 0.30)
+moduleColors <- merge$colors
+MEs <- merge$newMEs
+png(file.path(results_dir, "Original_vs_Merged_Modules.png"), width = 2000, height = 1500, res = 300)
+plotDendroAndColors(geneTree, cbind(dynamicColors, moduleColors), c("Original", "Merged"), dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05)
+dev.off()
+```
+
+```{r module-trait}
+# Select traits of interest (verify existence)
+want_traits <- c("Sex","Age_at_draw","PC1","PC2","PC3","SBP","d_cmb","fsrp","htnscore","lacunar_stroke","dm","bmi","stroke","caa_prob","caa","AD_status","cog_status","E4status")
+missing_traits <- setdiff(want_traits, colnames(traits))
+if(length(missing_traits)>0) message("Missing trait columns: ", paste(missing_traits, collapse=", "))
+traits_interest <- traits[, intersect(want_traits, colnames(traits)), drop = FALSE]
+
+moduleTraitCor <- cor(MEs, traits_interest, use = "pairwise.complete.obs")
+moduleTraitP <- corPvalueStudent(moduleTraitCor, nrow(expr))
+combined_sheet_module_Cor_P <- list("Cor"=moduleTraitCor, "Pval"=moduleTraitP)
+write.xlsx(combined_sheet_module_Cor_P, file.path(results_dir, "moduleTraitCor_Pval.xlsx"), rowNames = TRUE)
+
+textMatrix <- paste0(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitP, 1), ")")
+dim(textMatrix) <- dim(moduleTraitCor)
+png(file.path(results_dir, "Module_Trait_Heatmap.png"), width = 1600, height = 1400, res = 150)
+par(mar=c(8,14,4,2))
+labeledHeatmap(Matrix = moduleTraitCor, xLabels = colnames(traits_interest), yLabels = names(MEs), ySymbols = names(MEs), colorLabels = FALSE, colors = blueWhiteRed(50), textMatrix = textMatrix, setStdMargins = FALSE, cex.text = 0.6, zlim = c(-1,1), main = "Module–Trait Relationships")
+dev.off()
+```
+
+```{r hub-proteins-and-save}
+module <- "blue"
+modGenes <- moduleColors == module
+me_name <- paste0("ME", module)
+if(!me_name %in% colnames(MEs)) stop("Module eigengene not found: ", me_name)
+
+# Align MEs and traits to expr rows by rownames if possible
+if(!is.null(rownames(MEs)) && all(rownames(expr) %in% rownames(MEs))){
+  me_vec <- as.numeric(MEs[rownames(expr), me_name])
+} else {
+  me_vec <- as.numeric(MEs[, me_name])
+}
+
+trait_used_for_GS <- NA_character_
+if("PC1" %in% colnames(traits_interest)){
+  trait_used_for_GS <- "PC1"
+  if(!is.null(rownames(traits_interest)) && all(rownames(expr) %in% rownames(traits_interest))){
+    trait_pc1 <- as.numeric(traits_interest[rownames(expr), "PC1"])
+  } else {
+    trait_pc1 <- as.numeric(traits_interest$PC1)
+  }
+} else {
+  # fallback: choose the first numeric trait column available
+  numeric_cols <- names(which(sapply(traits_interest, is.numeric)))
+  if(length(numeric_cols) >= 1){
+    trait_used_for_GS <- numeric_cols[1]
+    message("'PC1' not found in traits_interest; using '", trait_used_for_GS, "' as fallback for GS calculation")
+    if(!is.null(rownames(traits_interest)) && all(rownames(expr) %in% rownames(traits_interest))){
+      trait_pc1 <- as.numeric(traits_interest[rownames(expr), trait_used_for_GS])
+    } else {
+      trait_pc1 <- as.numeric(traits_interest[[trait_used_for_GS]])
+    }
+  } else {
+    message("No numeric trait found in traits_interest; setting GS to NA and skipping hub candidate selection")
+    trait_pc1 <- rep(NA_real_, nrow(expr))
+  }
+}
+write.csv(data.frame(trait_used_for_GS = trait_used_for_GS), file = file.path(results_dir, "wgcna_trait_used_for_GS.csv"), row.names = FALSE)
+
+if(length(me_vec) != nrow(expr)) stop("Length mismatch between module eigengene and expression samples: ", length(me_vec), " vs ", nrow(expr))
+if(length(trait_pc1) != nrow(expr)) stop("Length mismatch between trait PC1 and expression samples: ", length(trait_pc1), " vs ", nrow(expr))
+
+# Compute module membership (MM) and gene significance (GS) per protein (columns of expr)
+MM <- apply(expr, 2, function(x) cor(x, me_vec, use = "pairwise.complete.obs"))
+GS <- apply(expr, 2, function(x) cor(x, trait_pc1, use = "pairwise.complete.obs"))
+
+# Save per-protein diagnostics
+mm_gs_df <- data.frame(Protein = colnames(expr), MM = MM, GS = GS)
+write.csv(mm_gs_df, file = file.path(results_dir, "module_MM_GS_by_protein.csv"), row.names = FALSE)
+
+hubCandidates <- which(abs(MM) > 0.7 & abs(GS) > 0.3)
+
+save(expr, traits, traits_interest, moduleColors, MEs, moduleTraitCor, moduleTraitP, file = file.path(results_dir, "WGCNA2_core_outputs.RData"))
+save(traits, moduleColors, MEs, expr, file = file.path(results_dir, "03_output.RData"))
+write.csv(as.data.frame(table(moduleColors)), file = file.path(results_dir, "module_color_counts.csv"))
+write.csv(data.frame(hubCandidates = hubCandidates), file = file.path(results_dir, "hub_candidates.csv"), row.names = FALSE)
+message("WGCNA outputs saved to: ", results_dir)
+```

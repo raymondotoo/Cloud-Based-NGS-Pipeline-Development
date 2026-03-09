@@ -1,0 +1,352 @@
+---
+title: "new"
+author: "Raymond Otoo"
+date: "2026-01-30"
+output: pdf_document
+---
+
+
+#=====================================================================================
+#
+#                                           Part A. WGCNA- ADNI_ADRC Combined
+# Reference tutorial : https://karobben.github.io/2020/06/10/R/WGCNA_2/
+#=====================================================================================
+
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+wgcna_dir <- paths$wgcna_dir
+getwd()
+```
+
+
+#=====================================================================================
+#
+# 1. Read Protein Expression Matrix and Phenotype data
+#=====================================================================================
+```{r}
+#Load key results from Part A of ADNI Proteomics analysis
+load(file.path(paths$results_dir, "02_output.RData"))
+```
+
+
+```{r}
+pheno_combat
+Proto_combat_z
+```
+
+```{r}
+library(WGCNA)
+library(dynamicTreeCut)
+
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+```
+
+```{r}
+# Expression matrix: samples x proteins
+expr <- Proto_combat_z   # ComBat-corrected, NOT Z-scaled
+ 
+# Phenotype data
+traits <- pheno_combat
+ 
+# Ensure matching sample order
+expr <- expr[rownames(traits), ]
+```
+
+
+#QC
+```{r}
+gsg <- goodSamplesGenes(expr, verbose = 3)
+expr <- expr[gsg$goodSamples, gsg$goodGenes]
+traits <- traits[gsg$goodSamples, ]
+```
+
+
+#samole clustering and outlier detection
+```{r}
+sampleTree <- hclust(dist(expr), method = "average")
+plot(sampleTree, main = "Sample clustering", sub = "", xlab = "")
+```
+
+#covariate adjustment
+```{r}
+#no covariate adjustment
+```
+
+
+#soft-threshold selection
+```{r}
+powers <- c(1:20)
+sft <- pickSoftThreshold(expr, powerVector = powers, verbose = 5)
+```
+
+#scale-free topology plot
+```{r}
+png(file.path(wgcna_dir, "SoftThreshold_ScaleFreeTopology.png"), width = 2000, height = 1500, res = 300)
+
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit (signed R²)",
+     type = "n",
+     main = "Scale independence")
+ 
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels = powers, col = "red")
+abline(h = 0.85, col = "blue", lty = 2)
+dev.off()
+```
+
+
+#mean connectivity plot
+```{r}
+png(file.path(wgcna_dir, "SoftThreshold_MeanConnectivity.png"), width = 2000, height = 1500, res = 300)
+ 
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     type = "n",
+     main = "Mean connectivity")
+ 
+text(sft$fitIndices[,1], sft$fitIndices[,5],
+     labels = powers, col = "red")
+dev.off()
+```
+#select power
+```{r}
+softPower <- 3
+```
+
+
+#Network construction
+```{r}
+adjacency <- adjacency(
+  expr,
+  power = softPower,
+  type = "signed hybrid"
+)
+ 
+TOM <- TOMsimilarity(adjacency, TOMType = "signed")
+dissTOM <- 1 - TOM
+```
+
+#gene clustering anf module detection
+```{r}
+geneTree <- hclust(as.dist(dissTOM), method = "average")
+```
+
+#gene dendrogram
+```{r}
+png(file.path(wgcna_dir, "Gene_dendrogram.png"), width = 2000, height = 1500, res = 300)
+ 
+plot(geneTree, main = "Protein clustering on TOM-based dissimilarity",
+     xlab = "", sub = "")
+dev.off()
+```
+
+
+#6b dynamic tree cut
+```{r}
+dynamicMods <- cutreeDynamic(
+  dendro = geneTree,
+  distM = dissTOM,
+  deepSplit = 3,
+  pamRespectsDendro = FALSE,
+  minClusterSize = 30
+)
+dynamicColors <- labels2colors(dynamicMods)
+```
+
+
+#dendogram + module colors
+```{r}
+png(file.path(wgcna_dir, "GeneDendrogram_DynamicModules.png"), width = 2000, height = 1500, res = 300)
+ 
+plotDendroAndColors(
+  geneTree,
+  dynamicColors,
+  "Dynamic Tree Cut",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05
+)
+dev.off()
+```
+#7. module eigengenes & merging
+```{r}
+MElist <- moduleEigengenes(expr, colors = dynamicColors)
+MEs <- MElist$eigengenes
+ 
+MEDiss <- 1 - cor(MEs)
+METree <- hclust(as.dist(MEDiss), method = "average")
+```
+
+#7a. Eigengene clustering
+```{r}
+png("Eigengene_clustering.png", width = 2000, height = 1500, res = 300)
+ 
+plot(METree, main = "Clustering of module eigengenes")
+abline(h = 0.30, col = "red")
+dev.off()
+```
+
+#7b. Merged modules
+```{r}
+merge <- mergeCloseModules(
+  expr,
+  dynamicColors,
+  cutHeight = 0.30
+)
+ 
+moduleColors <- merge$colors
+MEs <- merge$newMEs
+```
+
+#7c original vs merged modules
+```{r}
+png("Original_vs_Merged_Modules.png", width = 2000, height = 1500, res = 300)
+ 
+plotDendroAndColors(
+  geneTree,
+  cbind(dynamicColors, moduleColors),
+  c("Original", "Merged"),
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05
+)
+dev.off()
+```
+
+
+#8. Module-trait relationship(with module labels)
+```{r}
+traits_interest <- traits[, c(
+  "Sex",
+  "Age_at_draw",
+  "PC1",
+  "PC2",
+  "PC3",
+  "SBP",
+  "d_cmb",
+  "fsrp",
+  "htnscore",
+  "lacunar_stroke",
+  "dm",
+  "bmi",
+  "stroke",
+  "caa_prob",
+  "caa",
+  "AD_status",
+  "cog_status",
+  "E4status"
+)]
+```
+
+
+#correlation
+```{r}
+library(openxlsx)
+moduleTraitCor <- cor(MEs, traits_interest, use = "pairwise.complete.obs")
+moduleTraitP <- corPvalueStudent(moduleTraitCor, nrow(expr))
+
+#moduleTraitCor
+#moduleTraitP
+
+combined_sheet_module_Cor_P <- list("Cor"=moduleTraitCor, "Pval"=moduleTraitP)
+
+# Save output
+write.xlsx(combined_sheet_module_Cor_P, file.path(wgcna_dir, "moduleTraitCor_Pval.xlsx"), rowNames = TRUE)
+```
+
+
+#8a. Heatmap
+```{r}
+textMatrix <- paste0(
+  signif(moduleTraitCor, 2), "\n(",
+  signif(moduleTraitP, 1), ")"
+)
+ 
+dim(textMatrix) <- dim(moduleTraitCor)
+
+
+png(file.path(wgcna_dir, "Module_Trait_Heatmap.png"), width = 8000, height = 7000, res = 600)
+par(mar=c(8,14,4,2))#bottom ,left, top, right 
+labeledHeatmap(
+  Matrix = moduleTraitCor,
+  xLabels = colnames(traits_interest),
+  yLabels = names(MEs),
+  ySymbols = names(MEs),        # module labels restored
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.6,
+  zlim = c(-1,1),
+  main = "Module–Trait Relationships"
+
+)
+dev.off()
+```
+#. Hub protein analysis
+```{r}
+module <- "blue"   # example
+modGenes <- moduleColors == module
+ 
+MM <- cor(expr, MEs[, paste0("ME", module)], use = "p")
+GS <- cor(expr, traits_interest$PC1, use = "p")
+ 
+hubCandidates <- which(
+  abs(MM) > 0.7 & abs(GS) > 0.3
+)
+```
+
+
+## ---------------------------------------------------------
+## 9. Save WGCNA_2 outputs for downstream biology + ML
+## ---------------------------------------------------------
+ 
+```{r}
+save(
+  expr,
+  traits,
+  traits_interest,
+  moduleColors,
+  MEs,
+  moduleTraitCor,
+  moduleTraitP,
+  file = file.path(wgcna_dir, "WGCNA2_core_outputs.RData")
+)
+```
+
+
+
+
+```{r}
+colnames(MEs)
+```
+```{r}
+MEs
+```
+
+
+
+```{r}
+table(moduleColors)
+```
+# For multiple objects:
+```{r}
+save(traits,moduleColors,MEs,expr, file = file.path(wgcna_dir, "03_output.RData"))
+```
+
+```{r}
+#install.packages("report")
+library(report)
+report::report_packages()
+```
+

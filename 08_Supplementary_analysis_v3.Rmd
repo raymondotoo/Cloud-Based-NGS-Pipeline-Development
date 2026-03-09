@@ -1,0 +1,446 @@
+---
+title: "Untitled"
+author: "Raymond Otoo"
+date: "2026-02-26"
+output: pdf_document
+---
+
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+supp_dir <- paths$supplementary_dir
+getwd()
+```
+
+
+```{r}
+library(WGCNA)
+library(doParallel)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(ggrepel)
+ 
+# Enable WGCNA internal multi-threading where applicable
+enableWGCNAThreads()
+ 
+# Set up Parallel Backend
+n_cores_total <- parallel::detectCores()
+# Use all cores minus 2 to keep the system stable
+n_cores_to_use <- max(1, n_cores_total - 2) 
+registerDoParallel(cores = n_cores_to_use)
+ 
+message(paste("System has", n_cores_total, "cores. Parallel processing using:", n_cores_to_use))
+```
+
+
+#=====================================================================================
+# 01- Module Preservation (Discovery & Validation) ADNI_as_Reference
+#=====================================================================================
+```{r}
+load(file.path(paths$wgcna_dir, "03_output.RData"))
+ 
+# 1.1 Subset Cohorts
+sampleIDs <- rownames(expr)
+cohort <- ifelse(grepl("^ADNI", sampleIDs), "ADNI", 
+                 ifelse(grepl("^MAP", sampleIDs), "ADRC", NA))
+ 
+expr_ADNI <- expr[cohort == "ADNI", ]
+expr_ADRC <- expr[cohort == "ADRC", ]
+ 
+# 1.2 Setup Multi-set Data
+# We create a list containing both cohorts
+multiExpr_Recip <- list(
+  ADNI = list(data = expr_ADNI),
+  ADRC = list(data = expr_ADRC)
+)
+ 
+# Use the module labels from your combined analysis
+# We apply the same labels to both sets so we can test their preservation
+multiColor_Recip <- list(
+  ADNI = as.character(moduleColors),
+  ADRC = as.character(moduleColors)
+)
+ 
+# 1.3 RUN 1: ADNI as Reference (Validate in ADRC)
+message("Running Preservation: ADNI (Ref) -> ADRC (Test)")
+pres <- modulePreservation(
+  multiExpr_Recip,
+  multiColor = multiColor_Recip,
+  referenceNetworks = 1, # Index 1 is ADNI
+  nPermutations = 500, # 500 is sufficient for robust Z-scores
+  networkType       = "signed",
+  randomSeed = 123,
+  parallelCalculation = TRUE,
+  verbose = 3
+)
+ 
+
+save(pres, file = file.path(supp_dir, "adni_as_ref_preservation.RData"))
+```
+
+
+#Extract Z Summary (ADNI → ADRC)
+```{r}
+pres$preservation$Z$ref.ADNI$inColumnsAlsoPresentIn.ADRC
+```
+
+
+#Z Summary Table (Key Modules Only)
+```{r}
+keyModules <- c("MEred", "MElightyellow", "MEblack", "MEmagenta")
+keyModules_clean <- gsub("ME", "", keyModules)
+ 
+# Identify ADRC slot (test network)
+adrc_slot <- grep("ADRC",
+                  names(pres$preservation$Z$ref.ADNI),
+                  value = TRUE)
+ 
+# Extract Z statistics
+adrc_stats_Z <- pres$preservation$Z$ref.ADNI[[adrc_slot]][keyModules_clean, , drop=FALSE]
+ 
+# Extract medianRank statistics
+adrc_stats_median <- pres$preservation$observed$ref.ADNI[[adrc_slot]][keyModules_clean, , drop=FALSE]
+ 
+# Build final table
+final_z_summary <- data.frame(
+  Module = rownames(adrc_stats_Z),
+  Size = adrc_stats_Z$moduleSize,
+  Z_ADRC = adrc_stats_Z$Zsummary.pres,
+  medianRank_ADRC = adrc_stats_median$medianRank.pres,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    Preservation_Status = case_when(
+      Z_ADRC > 10 ~ "Strongly Preserved",
+      Z_ADRC > 2  ~ "Moderately Preserved",
+      TRUE        ~ "Weak/No Preservation"
+    )
+  ) %>%
+  arrange(medianRank_ADRC)   # lower medianRank = better preservation
+ 
+
+print(final_z_summary)
+```
+
+
+#Save all for preservation results into one excel workbook
+#NB: q statistics returned null so was omitted
+```{r}
+# Z statistics
+df_Z <- pres$preservation$Z$ref.ADNI[[adrc_slot]][keyModules_clean, , drop=FALSE] %>%
+  mutate(Module = rownames(.)) %>%
+  relocate(Module)
+ 
+# Observed statistics (contains medianRank)
+df_observed <- pres$preservation$observed$ref.ADNI[[adrc_slot]][keyModules_clean, , drop=FALSE] %>%
+  mutate(Module = rownames(.)) %>%
+  relocate(Module)
+ 
+# log.p statistics
+df_logp <- pres$preservation$log.p$ref.ADNI[[adrc_slot]][keyModules_clean, , drop=FALSE] %>%
+  mutate(Module = rownames(.)) %>%
+  relocate(Module)
+ 
+# q statistics
+#null
+ 
+# Write to single workbook
+write_xlsx(
+  list(
+    Selected_ZSummary = final_z_summary,#built from table above
+    Z_statistics = df_Z,
+    Observed_statistics = df_observed,
+    LogP_statistics = df_logp
+    #Q_statistics = df_q
+  ),
+  path = file.path(supp_dir, "Module_Preservation_AllStats_ADNI_reference.xlsx")
+)
+ 
+cat("Excel workbook successfully written.")
+```
+
+
+
+#Preservation Plot (ADNI → ADRC)
+```{r}
+adrc_slot_name <- grep("ADRC",
+                       names(pres$preservation$Z$ref.ADNI),
+                       value = TRUE)
+
+Z_ADRC <- pres$preservation$Z$ref.ADNI[[adrc_slot_name]][, "Zsummary.pres"]
+moduleSize <- pres$preservation$Z$ref.ADNI[[adrc_slot_name]][, "moduleSize"]
+moduleNames <- rownames(pres$preservation$Z$ref.ADNI[[adrc_slot_name]])
+
+plot_data <- data.frame(
+  size = moduleSize,
+  z = Z_ADRC,
+  label = moduleNames
+) %>%
+  filter(!label %in% c("gold", "grey")) %>%
+  mutate(is_key = ifelse(label %in%
+                           c("red","lightyellow","black","magenta"),
+                         "Key","Other"))
+```
+
+
+
+```{r}
+p_pres <- ggplot(plot_data, aes(x = size, y = z)) +
+  geom_hline(yintercept = 2, linetype = "dashed",
+             color = "blue", alpha = 0.7) +
+  geom_hline(yintercept = 10, linetype = "dashed",
+             color = "red", alpha = 0.7) +
+  geom_point(aes(color = is_key, size = is_key), alpha = 0.8) +
+  geom_text_repel(aes(label = label),
+                  size = 3.5, max.overlaps = 15) +
+  scale_color_manual(values = c("Key"="firebrick",
+                                "Other"="grey40")) +
+  scale_size_manual(values = c("Key"=4,
+                               "Other"=2)) +
+  labs(title = "Module Preservation: ADNI → ADRC",
+       subtitle = "Zsummary Score vs Module Size",
+       x = "Module Size",
+       y = "Zsummary Score") +
+  theme_minimal()
+ggsave(file.path(supp_dir, "Figure1_Module_Preservation_ADNI_reference.png"),
+       plot = p_pres, width = 8, height = 6, dpi = 600)
+```
+
+
+
+#=====================================================================================
+#
+# 02- STEP 2 — Cohort-Stratified Module–Trait Correlations (Sensitivity to AD Status and Adjusted Regression)
+# Goal:
+#   Show module–trait relationships are not driven by one cohort.
+#  Goal: Isolate the CSVD signal from Alzheimer's pathology.Interpretation: By adding AD_status as a covariate, the resulting p-value for the Trait tells us if the protein module is specifically related to vascular issues (CSVD) regardless of whether the      #   patient has AD.
+#=====================================================================================
+```{r}
+load(file.path(paths$wgcna_dir, "WGCNA2_core_outputs.RData"))
+ 
+# Function to run AD-adjusted regressions for all key modules
+# Addresses Point 5: MEmodule ~ trait + age + sex + AD_status
+run_adjusted_models <- function(MEs, traits, module_name, trait_name) {
+  df_reg <- data.frame(
+    ME = MEs[[module_name]],
+    Trait = traits[[trait_name]],
+    Age = traits$Age_at_draw,
+    Sex = traits$Sex,
+    AD = traits$AD_status
+  ) %>% na.omit()
+  fit <- lm(ME ~ Trait + Age + Sex + AD, data = df_reg)
+  res <- coef(summary(fit))["Trait", ]
+  return(data.frame(Module = module_name, Trait = trait_name, 
+                    Beta = res[1], SE = res[2], P = res[4]))
+}
+ 
+# Mapping modules to their primary traits of interest
+analysis_map <- list(
+  list(m = "MEred", t = "fsrp"),
+  list(m = "MEred", t = "htnscore"),
+  list(m = "MElightyellow", t = "PC1"),
+  list(m = "MEblack", t = "caa"),
+  list(m = "MEmagenta", t = "bmi")
+)
+ 
+# Execute via purrr or lapply
+adj_results <- lapply(analysis_map, function(x) {
+  run_adjusted_models(MEs[rownames(expr),], traits_interest[rownames(expr),], x$m, x$t)
+}) %>% bind_rows()
+ 
+print(adj_results)
+```
+
+
+
+#=====================================================================================
+#
+# 03-Module Membership (kME Extraction) 
+# Orthogonal Evidence: kME Extraction
+#=====================================================================================
+```{r}
+# Addresses Point 1: Quantify how much proteins in key modules align with trait hits
+kME_table <- signedKME(expr, MEs)
+ 
+# Create a clean table for export
+final_protein_kME <- data.frame(
+  ProteinID = colnames(expr),
+  ModuleColor = moduleColors
+) %>%
+  cbind(kME_table)
+ 
+# Export to Excel for reviewers
+write_xlsx(final_protein_kME, file.path(supp_dir, "Protein_Module_Membership_kME.xlsx"))
+```
+
+
+#=====================================================================================
+# Point 6: Coefficient Comparison (Final Evidence)
+# Goal: Quantify the shift in association after adjustment.
+# Interpretation: If the Beta (slope) remains similar to the unadjusted correlation, the association is "Orthogonal" to AD status. This is your strongest argument for novelty in CSVD subtyping.
+#=====================================================================================
+```{r}
+sampleIDs <- rownames(expr)
+ 
+cohort <- ifelse(grepl("^ADNI", sampleIDs), "ADNI",
+          ifelse(grepl("^MAP", sampleIDs), "ADRC", NA))
+```
+
+
+#Split MEs and traits
+```{r}
+MEs_ordered <- MEs[rownames(expr), ]
+traits_ordered <- traits_interest[rownames(expr), ]
+ 
+MEs_ADNI  <- MEs_ordered[cohort == "ADNI", ]
+MEs_ADRC  <- MEs_ordered[cohort == "ADRC", ]
+ 
+traits_ADNI <- traits_ordered[cohort == "ADNI", ]
+traits_ADRC <- traits_ordered[cohort == "ADRC", ]
+```
+
+
+
+```{r}
+# Compare raw correlation vs adjusted Beta
+comparison_table <- adj_results %>%
+  mutate(Original_Cor = sapply(1:n(), function(i) {
+    cor(MEs_ordered[[Module[i]]], traits_interest[[Trait[i]]], use="p")
+  }))
+comparison_table
+
+write_xlsx(comparison_table, file.path(supp_dir, "Final_Trait_Sensitivity_Summary.xlsx"))
+```
+
+
+#=====================================================================================
+# Orthogonal Evidence: Convergence with Single-Protein Hits
+# Goal: Verify that the "Module" findings match "Single Protein" findings from earlier in your project.Interpretation: If the proteins with the highest kME in the red module are the same proteins that showed up as top hits in your Olink/SOMA volcano plots for   # FSRP, you have "convergent evidence" from two different statistical methods (WGCNA and Linear Regression).
+#=====================================================================================
+```{r}
+# Check convergence (Example for Red module)
+red_hub_proteins <- final_protein_kME %>% filter(moduleColors == "red") %>% arrange(desc(kMEred))
+head(red_hub_proteins, 10)
+```
+
+
+#3. Sensitivity Forest Plot (Points 4, 5 & 6)
+#This plot visualizes how the association strength (Beta) changes between the Unadjusted model and the AD-Adjusted model. It proves your findings are independent of Alzheimer's pathology.
+```{r}
+# Prepare data for plotting from comparison_table
+forest_data <- comparison_table %>%
+  dplyr::select(Module, Trait, Unadj_Beta = Original_Cor, Adj_Beta = Beta, SE) %>%
+  tidyr::pivot_longer(cols = c(Unadj_Beta, Adj_Beta), names_to = "Model", values_to = "Estimate")
+ 
+ggplot(forest_data, aes(x = Estimate, y = interaction(Module, Trait), color = Model)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbarh(aes(xmin = Estimate - (1.96 * SE), xmax = Estimate + (1.96 * SE)), 
+                 position = position_dodge(width = 0.5), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  labs(title = "Sensitivity Analysis: AD Adjustment",
+       subtitle = "Error bars represent 95% CI",
+       y = "Module-Trait Pair", x = "Effect Size (Beta/Correlation)") +
+  theme_bw()
+ggsave(file.path(supp_dir, "Figure3_AD_Sensitivity_Forest.png"), width = 8, height = 6, dpi = 600)
+```
+
+
+#4. Top Hub Proteins (kME) Lollipop plot  --- Convergence
+#This plot identifies the "leading edge" proteins in your key modules. It is the "orthogonal evidence" showing that the modules are driven by biologically relevant hub proteins.
+```{r}
+# Select top 5 proteins per key module
+top_hubs <- final_protein_kME %>%
+  filter(ModuleColor %in% c("red", "lightyellow", "black", "magenta")) %>%
+  tidyr::pivot_longer(cols = starts_with("kME"), names_to = "kME_Type", values_to = "kME_Value") %>%
+  # Match the kME column to the module color
+  filter(gsub("kME", "", kME_Type) == ModuleColor) %>%
+  group_by(ModuleColor) %>%
+  slice_max(order_by = kME_Value, n = 10)
+ 
+ggplot(top_hubs, aes(x = reorder(ProteinID, kME_Value), y = kME_Value)) +
+  geom_segment(aes(xend = reorder(ProteinID, kME_Value), yend = 0), color = "black") +
+  geom_point(aes(color = ModuleColor), size = 4) +
+  coord_flip() +
+  facet_wrap(~ModuleColor, scales = "free_y") +
+  scale_color_identity() +
+  labs(title = "Key Module Hub Proteins",
+       subtitle = "Ranked by Module Membership (kME)",
+       x = "Protein (SOMA ID / Gene)", y = "kME Strength") +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank()) # Removes horizontal noise
+ggsave(file.path(supp_dir, "Figure4_Top_Hub_Proteins.png"), width = 10, height = 8, dpi = 600)
+```
+
+
+#2.3 Corrlelations
+```{r}
+cor_ADNI <- cor(MEs_ADNI, traits_ADNI, use="pairwise.complete.obs")
+p_ADNI   <- corPvalueStudent(cor_ADNI, nrow(MEs_ADNI))
+ 
+cor_ADRC <- cor(MEs_ADRC, traits_ADRC, use="pairwise.complete.obs")
+p_ADRC   <- corPvalueStudent(cor_ADRC, nrow(MEs_ADRC))
+```
+
+
+```{r}
+keyModules <- c("MEred", "MElightyellow", "MEblack", "MEmagenta")
+ 
+cor_ADNI[keyModules, ]
+cor_ADRC[keyModules, ]
+```
+
+
+
+```{r}
+# Focus only on your keyModules for clarity
+key_cor_ADNI <- cor_ADNI[keyModules, , drop=FALSE]
+key_p_ADNI   <- p_ADNI[keyModules, , drop=FALSE]
+ 
+key_cor_ADRC <- cor_ADRC[keyModules, , drop=FALSE]
+key_p_ADRC   <- p_ADRC[keyModules, , drop=FALSE]
+```
+
+
+
+##Module_Trait_Comparison_vertical ADNI-ADRC
+```{r}
+plot_wgcna_heatmap <- function(cor_matrix, p_matrix, title) {
+  textMatrix <- paste(signif(cor_matrix, 2), "\n(",
+                      signif(p_matrix, 1), ")", sep = "")
+  dim(textMatrix) <- dim(cor_matrix)
+  par(mar = c(10, 12, 4, 4))
+  labeledHeatmap(
+    Matrix = cor_matrix,
+    xLabels = colnames(cor_matrix),
+    yLabels = rownames(cor_matrix),
+    ySymbols = rownames(cor_matrix),
+    colorLabels = FALSE,
+    colors = blueWhiteRed(50),
+    textMatrix = textMatrix,
+    setStdMargins = FALSE,
+    cex.text = 0.6,
+    cex.lab.x = 0.8,
+    cex.lab.y = 0.8,
+    zlim = c(-1,1),
+    main = title
+  )
+}
+ 
+png(file.path(supp_dir, "Module_Trait_Comparison_vertical.png"), width = 8000, height = 7000, res = 600)
+ 
+par(mfrow = c(2, 1))  # 2 rows, 1 column
+ 
+plot_wgcna_heatmap(key_cor_ADNI, key_p_ADNI,
+                   "ADNI: Module–Trait Relationships")
+ 
+plot_wgcna_heatmap(key_cor_ADRC, key_p_ADRC,
+                   "ADRC: Module–Trait Relationships")
+ 
+dev.off()
+```

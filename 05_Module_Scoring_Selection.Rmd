@@ -1,0 +1,303 @@
+---
+title: "05_Network_Analysis"
+author: "Raymond Otoo"
+date: "2026-02-03"
+output: pdf_document
+---
+
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+getwd()
+```
+
+
+#=====================================================================================
+#
+# 1. Read Protein Expression Matrix and Phenotype data
+#=====================================================================================
+```{r}
+#Load key results from Part A of ADNI Proteomics analysis
+load(file.path(paths$wgcna_dir, "WGCNA2_core_outputs.RData"))
+```
+
+
+############################################################
+## WGCNA module–trait annotation and protein signature derivation
+## no cohort residualization
+## Rationale: cohort residualization had minimal impact on structure
+############################################################
+```{r}
+## Libraries
+library(dplyr)
+library(tibble)
+```
+
+ 
+## ---------------------------------------------------------
+## 1. Read module–trait correlation and p-value matrices
+## ---------------------------------------------------------
+```{r} 
+cor_mat <- moduleTraitCor
+pval_mat <- moduleTraitP
+``` 
+
+
+## ---------------------------------------------------------
+## 2. Define biologically motivated trait groups
+## ---------------------------------------------------------
+```{r} 
+# Vascular / CSVD (PC1 = strongest WMH proteomic signal)
+vascular_traits <- c(
+  "PC1", 
+  "fsrp", 
+  "htnscore", 
+  "SBP", 
+  "d_cmb", 
+  "lacunar_stroke"
+)
+ 
+# Cerebral amyloid angiopathy
+caa_traits <- c(
+  "caa_prob", 
+  "caa")
+ 
+# AD / amyloid / cognition
+ad_traits <- c(
+  "AD_status", 
+  "E4status", 
+  "cog_status")
+
+``` 
+
+```{r}
+summary(abs(cor_mat[, vascular_traits]))
+summary(abs(cor_mat[, caa_traits]))
+summary(abs(cor_mat[, ad_traits]))
+
+
+#summary(pval_mat[, vascular_traits])
+```
+```{r}
+hist(abs(cor_mat[, "PC1"]), breaks = 30, main = "Module–PC1 correlations")
+```
+
+
+
+## ---------------------------------------------------------
+## 3. Multiple testing correction (FDR per trait)
+## ---------------------------------------------------------
+```{r} 
+qval_mat <- pval_mat
+
+for (trait in colnames(pval_mat)) {
+  qval_mat[, trait] <- p.adjust(pval_mat[, trait], method = "BH")
+}
+ 
+## Thresholds for defining meaningful module–trait associations
+r_thresh <- 0.12
+q_thresh <- 0.05
+```
+
+ 
+## ---------------------------------------------------------
+## 4. Helper function: count significant trait "hits" per module
+##    (sign-aware)
+## ---------------------------------------------------------
+```{r} 
+score_modules <- function(trait_set,
+                          direction = c("two_sided", "positive", "negative")) {
+  direction <- match.arg(direction)
+  sapply(rownames(cor_mat), function(mod) {
+ 
+    r_vec <- as.numeric(cor_mat[mod, trait_set])
+    q_vec <- as.numeric(qval_mat[mod, trait_set])
+ 
+    if (direction == "two_sided") {
+      sum(abs(r_vec) >= r_thresh & q_vec < q_thresh, na.rm = TRUE)
+
+    } else if (direction == "positive") {
+      sum(r_vec >= r_thresh & q_vec < q_thresh, na.rm = TRUE)
+
+    } else {
+      sum(r_vec <= -r_thresh & q_vec < q_thresh, na.rm = TRUE)
+    }
+  })
+}
+``` 
+
+
+## ---------------------------------------------------------
+## 5. Compute biology-specific module hit counts
+## ---------------------------------------------------------
+```{r} 
+vascular_hits <- score_modules(vascular_traits, direction = "positive")
+caa_hits      <- score_modules(caa_traits,      direction = "positive")
+ad_hits_pos   <- score_modules(ad_traits,       direction = "positive")
+ad_hits_neg   <- score_modules(ad_traits,       direction = "negative")
+module_scores <- data.frame(
+  module        = rownames(cor_mat),
+  vascular_hits = vascular_hits,
+  caa_hits      = caa_hits,
+  ad_hits_pos   = ad_hits_pos,
+  ad_hits_neg   = ad_hits_neg,
+  stringsAsFactors = FALSE
+)
+``` 
+
+
+## ---------------------------------------------------------
+## 6. Manual biological labeling (sign-aware interpretation)
+## ---------------------------------------------------------
+```{r} 
+module_scores$label_auto <- "none"
+
+# Core vascular / CSVD–hypertension modules 
+module_scores$label_auto[
+  module_scores$vascular_hits >= 2
+] <- "vascular"
+
+# Mixed vascular + AD + CAA biology 
+module_scores$label_auto[
+  module_scores$caa_hits >= 1
+] <- "CAA"
+
+# AD resilience / healthy aging module 
+module_scores$label_auto[
+  module_scores$ad_hits_neg >= 1
+] <- "protective_healthy"
+``` 
+
+
+```{r}
+module_scores
+```
+
+```{r}
+#---------------------------------------------------------
+# Save module scoring table
+#---------------------------------------------------------
+
+dir.create("results/network_annotation",
+           recursive = TRUE,
+           showWarnings = FALSE)
+
+write.csv(
+  module_scores,
+  "results/network_annotation/Module_Trait_Scoring_Table.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+
+############################################################
+## Alternative Continuous Domain Scoring Framework
+## (Magnitude-aware, FDR-controlled, no arbitrary r threshold)
+############################################################
+```{r}
+
+
+library(dplyr)
+
+#---------------------------------------------------------
+# 1. Ensure FDR matrix exists
+#---------------------------------------------------------
+
+if (!exists("qval_mat")) {
+  qval_mat <- pval_mat
+  for (trait in colnames(pval_mat)) {
+    qval_mat[, trait] <- p.adjust(pval_mat[, trait], method = "BH")
+  }
+}
+
+q_thresh <- 0.05
+
+#---------------------------------------------------------
+# 2. Continuous scoring function
+#    Sum of absolute correlations for FDR-significant traits
+#---------------------------------------------------------
+
+score_modules_continuous <- function(trait_set) {
+  sapply(rownames(cor_mat), function(mod) {
+
+    r_vec <- as.numeric(cor_mat[mod, trait_set])
+    q_vec <- as.numeric(qval_mat[mod, trait_set])
+
+    sum(abs(r_vec[q_vec < q_thresh]), na.rm = TRUE)
+  })
+}
+
+#---------------------------------------------------------
+# 3. Compute continuous domain scores
+#---------------------------------------------------------
+
+vascular_score <- score_modules_continuous(vascular_traits)
+caa_score      <- score_modules_continuous(caa_traits)
+ad_score       <- score_modules_continuous(ad_traits)
+
+module_scores_continuous <- data.frame(
+  module         = rownames(cor_mat),
+  vascular_score = vascular_score,
+  caa_score      = caa_score,
+  ad_score       = ad_score,
+  stringsAsFactors = FALSE
+)
+
+#---------------------------------------------------------
+# 4. Standardize scores (z-scores)
+#---------------------------------------------------------
+
+module_scores_continuous <- module_scores_continuous %>%
+  mutate(
+    vascular_z = scale(vascular_score)[,1],
+    caa_z      = scale(caa_score)[,1],
+    ad_z       = scale(ad_score)[,1]
+  )
+
+#---------------------------------------------------------
+# 5. Assign dominant biological domain (based on z-score magnitude)
+#---------------------------------------------------------
+
+module_scores_continuous$label_auto_continuous <- apply(
+  module_scores_continuous[, c("vascular_z","caa_z","ad_z")],
+  1,
+  function(x) {
+    domains <- c("vascular","CAA","AD")
+    domains[which.max(abs(x))]
+  }
+)
+
+#---------------------------------------------------------
+# 6. Save results for comparison
+#---------------------------------------------------------
+
+dir.create("results/network_annotation",
+           recursive = TRUE,
+           showWarnings = FALSE)
+
+write.csv(
+  module_scores_continuous,
+  "results/network_annotation/Module_Trait_Scoring_Continuous.csv",
+  row.names = FALSE
+)
+
+#---------------------------------------------------------
+# 7. Display side-by-side comparison with original scoring
+#---------------------------------------------------------
+
+comparison_table <- module_scores %>%
+  left_join(module_scores_continuous,
+            by = "module")
+
+print(comparison_table)
+
+
+```
+

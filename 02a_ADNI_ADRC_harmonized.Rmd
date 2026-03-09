@@ -1,0 +1,227 @@
+---
+title: "02_ADNI_ADRC_harmonized"
+author: "Raymond Otoo"
+date: "2025-11-13"
+output: pdf_document
+---
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+getwd()
+```
+
+
+```{r}
+library(sva)
+library(limma)
+library(openxlsx)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+```
+
+
+```{r}
+PhenoInfo_numeric <- read.xlsx(file.path(paths$results_dir, "PhenoInfo_numeric.xlsx"))
+# Phenotypic data
+ProtoData_filtered <- read.xlsx(file.path(paths$results_dir, "ProtoData_filtered.xlsx"))   
+
+PhenoInfo_numeric
+ProtoData_filtered
+```
+
+```{r}
+# Proteomics Data
+ProtoData_filtered <- ProtoData_filtered %>%
+  rename(SampleID = 1) %>%
+  mutate(SampleID = trimws(SampleID))
+ 
+# Phenotype Data
+PhenoInfo_numeric <- PhenoInfo_numeric %>%
+  rename(SampleID = 1) %>%
+  mutate(SampleID = trimws(SampleID))
+
+PhenoInfo_numeric
+ProtoData_filtered
+```
+
+
+```{r}
+# Set Row Names for alignment and remove the SampleID column from the phenotype data.
+# Note: The expression data will be transposed later, so we keep SampleID as a column for now.
+rownames(PhenoInfo_numeric) <- PhenoInfo_numeric$SampleID
+PhenoInfo_numeric <- PhenoInfo_numeric %>% select(-SampleID)
+
+```
+
+
+```{r}
+PhenoInfo_numeric
+ProtoData_filtered
+```
+
+```{r}
+# Ensure Cohort is a factor for ComBat
+PhenoInfo_numeric$Cohort <- as.factor(PhenoInfo_numeric$Cohort)
+```
+
+```{r}
+PhenoInfo_numeric
+```
+
+```{r}
+dim(PhenoInfo_numeric)
+dim(ProtoData_filtered)
+```
+#Prepare Expression matrix
+```{r}
+# Step 2a: Convert to strictly numeric matrix (ComBat requirement)
+# Use the Proto data *without* the SampleID column for matrix conversion.
+expr_data_for_matrix <- ProtoData_filtered %>% select(-c(SampleID,drawDate,Panel.OLINK))
+expr_matrix <- as.matrix(sapply(expr_data_for_matrix, as.numeric))
+rownames(expr_matrix) <- ProtoData_filtered$SampleID # Re-assign clean IDs to the matrix
+ 
+# Step 2b: Transpose (Proteins as Rows, Samples as Columns)
+expr_matrix_transposed <- t(expr_matrix)
+# Step 2c: Handle NAs in the Transposed Matrix
+all_na_rows <- which(rowSums(is.na(expr_matrix_transposed)) == ncol(expr_matrix_transposed))
+if(length(all_na_rows) > 0) {
+    expr_matrix_clean <- expr_matrix_transposed[-all_na_rows, ]
+    print(paste("Removed", length(all_na_rows), "proteins that were all NA."))
+} else {
+    expr_matrix_clean <- expr_matrix_transposed
+}
+```
+
+
+#Define batch and design
+```{r}
+# --- CRITICAL FIX 2: ALIGNMENT USING MATCH() ---
+# 1. Define the exact order of samples from the clean matrix
+sample_order <- colnames(expr_matrix_clean)
+
+# 2. Use match() to find the index of these samples in the phenotype data
+match_index <- match(sample_order, rownames(PhenoInfo_numeric))
+
+# 3. Create the phenotype data frame and batch vector in the correct, guaranteed order
+pheno_combat <- PhenoInfo_numeric[match_index, ]
+batch_vector <- pheno_combat$Cohort 
+
+# Null Model: Adjust only for the batch variable (Cohort)
+mod_null <- model.matrix(~1, data = pheno_combat)
+
+
+# ===== PCA BEFORE BATCH CORRECTION =====
+library(ggplot2)
+# 1. Run PCA on the expression matrix BEFORE batch correction
+# Assuming Proto_before_z is your standardized matrix prior to ComBat
+pca_before <- prcomp(t(expr_matrix_clean), scale. = TRUE)
+ 
+# 2. Prepare data frame for plotting
+pca_df_before <- data.frame(
+  PC1 = pca_before$x[, 1],
+  PC2 = pca_before$x[, 2],
+  Cohort = pheno_combat$Cohort
+)
+ 
+# 3. Create the plot object
+pca_plot_before <- ggplot(pca_df_before, aes(PC1, PC2, color = Cohort)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_bw(base_size = 14) +
+  ggtitle("PCA Before ComBat: Visible Cohort Effects") +
+  theme(plot.title = element_text(hjust = 0.5))
+ 
+# 4. Display the plot
+print(pca_plot_before)
+ 
+# 5. Save the plot
+ggsave(filename = file.path(paths$plots_dir, "PCA_Before_Batch_Correction.png"), 
+       plot = pca_plot_before, 
+       width = 8, 
+       height = 6, 
+       dpi = 300)
+ 
+# 6. Check variance explained
+print("Variance Explained Before Batch Correction:")
+summary(pca_before)$importance[2, 1:3]
+```
+
+
+#Run CoBat and Finalize
+```{r}
+# Run ComBat
+combat_adjusted_matrix <- ComBat(
+    dat = expr_matrix_clean, 
+    batch = batch_vector, 
+    mod = mod_null,
+    par.prior = TRUE, 
+    prior.plots = FALSE 
+)
+# Transpose back (Samples as Rows, Proteins as Columns)
+Proto_Combat_Adjusted <- as.data.frame(t(combat_adjusted_matrix))
+
+# ------------------This was Re-normalizing the matrix as this has already been done---------------------
+
+# Re-Zscore the batch-adjusted data for comparability
+#Proto_combat_z <- as.data.frame(scale(Proto_Combat_Adjusted))
+# ------------------This was Re-normalizing the matrix as this has already been done---------------------
+
+Proto_combat_z <- Proto_Combat_Adjusted 
+ 
+# Save output
+write.xlsx(Proto_combat_z, file.path(paths$results_dir, "ADNI_ADRC_Proteomics_Combat_Adjusted_Zscored.xlsx"), rowNames = TRUE)
+```
+
+
+## PCA AFTER BATCH CORRECTION 
+```{r}
+library(ggplot2)
+ 
+# 1. Create a directory for your plots if it doesn't exist
+if(!dir.exists("plots")) dir.create("plots")
+ 
+# 2. Ensure sample order matches phenotype data
+Proto_combat_z <- Proto_combat_z[rownames(pheno_combat), ]
+ 
+# 3. Run PCA
+pca_after <- prcomp(Proto_combat_z, scale. = TRUE)
+ 
+# 4. Prepare data frame
+pca_df_after <- data.frame(
+  PC1 = pca_after$x[, 1],
+  PC2 = pca_after$x[, 2],
+  Cohort = pheno_combat$Cohort
+)
+ 
+# 5. Create the plot object
+pca_plot <- ggplot(pca_df_after, aes(PC1, PC2, color = Cohort)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_bw(base_size = 14) +
+  ggtitle("PCA After ComBat: Cohort Effect Removed") +
+  theme(plot.title = element_text(hjust = 0.5))
+ 
+# 6. Display the plot in RStudio
+print(pca_plot)
+ 
+# 7. SAVE the plot as a high-resolution PNG
+# Adjust width/height as needed for your paper/report
+ggsave(filename = file.path(paths$plots_dir, "PCA_After_Batch_Correction.png"), 
+       plot = pca_plot, 
+       width = 8, 
+       height = 6, 
+       dpi = 300)
+ 
+# 8. Output Importance Summary to console
+print("Variance Explained After Batch Correction:")
+summary(pca_after)$importance[2, 1:3]
+```
+
+```{r}
+# For multiple objects:
+save(pheno_combat, Proto_combat_z , file = file.path(paths$results_dir, "02_output.RData"))
+```
+

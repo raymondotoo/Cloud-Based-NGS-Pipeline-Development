@@ -1,0 +1,807 @@
+---
+title: "04_Functional_Analysis"
+author: "Raymond Otoo"
+date: "2026-02-04"
+output: pdf_document
+---
+#=====================================================================================
+#
+#                                           Part B. Functional Analysis - GO Analysis
+#
+#=====================================================================================
+
+```{r}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+functional_dir <- paths$functional_dir
+dir.create(file.path(functional_dir, "GO_plots"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(functional_dir, "fgsea"), recursive = TRUE, showWarnings = FALSE)
+run_go_plots <- FALSE
+getwd()
+```
+
+
+#Load libraries & WGCNA outputs
+```{r}
+#BiocManager::install(c("clusterProfiler", "org.Hs.eg.db"))
+library(WGCNA)
+library(dplyr)
+library(readr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ReactomePA)
+library(ggplot2)
+library(openxlsx)
+
+#Load key results from Part A of ADNI Proteomics analysis
+load(file.path(paths$wgcna_dir, "WGCNA2_core_outputs.RData"))
+
+# expr: samples x proteins
+# moduleColors: named vector (proteins)
+stopifnot(colnames(expr) == names(moduleColors))
+
+
+```
+
+#Load SOMAmer annotation + background
+```{r}
+# Analyte annotation
+analyte_info <- read.delim(file.path(paths$data_dir, "CSF_SOMAscan7k_analyte_information.tsv"),sep = "\t", header = TRUE, check.names = FALSE)
+
+# Background universe
+background <- read.csv(file.path(paths$data_dir, "background_soma.csv"))
+background_soma <- background$EntrezGeneSymbol
+
+length(background_soma)
+head(analyte_info)
+```
+
+#Map SOMAmer → SYMBOL → ENTREZ
+```{r}
+all_features <- colnames(expr)
+ 
+feature_key <- analyte_info %>%
+  dplyr::filter(Analytes %in% all_features) %>%
+  dplyr::select(Analytes, EntrezGeneSymbol) %>%
+  dplyr::distinct() %>%
+  dplyr::rename(
+    SOMAmer = Analytes,
+    SYMBOL  = EntrezGeneSymbol
+  )
+ 
+map_all <- bitr(
+  feature_key$SYMBOL,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE)
+ 
+universe_entrez <- map_all$ENTREZID
+```
+
+#Module → Gene tables (CSV + Excel)
+```{r}
+modules_to_export <- setdiff(unique(moduleColors), "grey")
+
+module_gene_list <- list()
+
+for (mod in modules_to_export) {
+
+  somamers <- colnames(expr)[moduleColors == mod]
+
+module_df <- feature_key %>%
+  dplyr::filter(SOMAmer %in% somamers) %>%
+  dplyr::left_join(map_all, by = "SYMBOL") %>%
+  dplyr::mutate(Module = mod) %>%
+  dplyr::select(Module, SOMAmer, SYMBOL, ENTREZID)
+
+  module_gene_list[[mod]] <- module_df
+}
+
+final_gene_list_df <- bind_rows(module_gene_list)
+write_csv(final_gene_list_df, file.path(functional_dir, "Module_Gene_Lists.csv"))
+```
+
+#Column-wise Excel
+```{r}
+module_gene_vectors <- lapply(modules_to_export, function(mod) {
+
+  somamers <- colnames(expr)[moduleColors == mod]
+
+  feature_key %>%
+    filter(SOMAmer %in% somamers) %>%
+    inner_join(map_all, by = "SYMBOL") %>%
+    pull(SYMBOL) %>%
+    unique()
+})
+
+names(module_gene_vectors) <- modules_to_export
+
+max_len <- max(lengths(module_gene_vectors))
+padded <- lapply(module_gene_vectors, function(x) c(x, rep(NA, max_len - length(x))))
+final_transposed_df <- as.data.frame(padded)
+
+write.xlsx(
+  final_transposed_df,
+  file.path(functional_dir, "Module_Genes_Columnwise.xlsx"),
+  overwrite = TRUE
+)
+
+```
+
+#Functional enrichment (GO-BP only in this notebook)
+```{r}
+plot_go_for_module <- function(module_color) {
+
+  somamers <- colnames(expr)[moduleColors == module_color]
+
+  entrez <- feature_key %>%
+    filter(SOMAmer %in% somamers) %>%
+    inner_join(map_all, by = "SYMBOL") %>%
+    pull(ENTREZID) %>%
+    unique()
+
+  if (length(entrez) == 0) return(NULL)
+
+  ego <- enrichGO(
+    gene = entrez,
+    universe = universe_entrez,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 0.1,
+    readable = TRUE
+  )
+
+  if (is.null(ego) || nrow(ego@result) == 0) return(NULL)
+
+  go_df <- ego@result %>%
+    filter(p.adjust <= 0.1) %>%
+    arrange(p.adjust) %>%
+    head(10)
+
+  if (nrow(go_df) == 0) return(NULL)
+
+  ggplot(go_df, aes(GeneRatio, Description)) +
+    geom_point(aes(size = Count, color = p.adjust)) +
+    scale_color_gradient(low = "red", high = "blue") +
+    theme_bw() +
+    labs(
+      title = paste("GO-BP Enrichment – Module", module_color),
+      x = "Gene Ratio",
+      y = NULL
+    )
+}
+```
+
+#Run enrichment for all modules
+```{r}
+if (run_go_plots) {
+  dir.create(functional_dir, showWarnings = FALSE)
+  dir.create(file.path(functional_dir, "GO_plots"), showWarnings = FALSE)
+
+  for (mod in modules_to_export) {
+    p <- plot_go_for_module(mod)
+    if (!is.null(p)) {
+      ggsave(
+        file.path(functional_dir, "GO_plots", paste0("GO_", mod, ".png")),
+        p, width = 10, height = 6
+      )
+    }
+  }
+} else {
+  message("Skipping GO plot generation in 04_Functional_Analysis.Rmd. Use 07a/07b for enrichment workflows.")
+}
+
+```
+
+```{r}
+# The original mixed notebook continued into an embedded fgsea workflow.
+# That logic is now executed in the dedicated original notebooks:
+# 07a_Functional_Analysis_GSEA.Rmd and 07b_Funtional_Analysis_ORA.Rmd.
+knitr::knit_exit()
+```
+
+
+#=====================================================================================
+#
+#                                           Part B. GSEA - Fgsea
+#
+#=====================================================================================
+```{r}
+library(fgsea)
+library(msigdbr)
+```
+
+
+
+```{r}
+ls()
+```
+```{r}
+#-----------------------------------------
+# Recompute module membership (kME)
+#-----------------------------------------
+ 
+# expr: samples x proteins
+# MEs : samples x module eigengenes
+ 
+stopifnot(all(colnames(expr) == names(moduleColors)))
+ 
+datKME <- as.data.frame(
+  cor(expr, MEs, use = "p")
+)
+ 
+colnames(datKME) <- paste0("kME", substring(colnames(MEs), 3))
+rownames(datKME) <- colnames(expr)
+```
+
+```{r}
+datKME
+```
+
+
+
+
+#-----------------------------------------
+# Create ranked gene lists for fgsea
+#-----------------------------------------
+ 
+# datKME assumed present from WGCNA outputs
+# rows: proteins (SOMAmers)
+# columns: kME values per module
+```{r}
+stopifnot(rownames(datKME) %in% feature_key$SOMAmer)
+```
+
+
+#-----------------------------------------
+# Load GO gene sets (fgsea-compatible)
+#-----------------------------------------
+```{r}
+go_bp <- msigdbr(
+  species = "Homo sapiens",
+  category = "C5",
+  subcategory = "BP"
+)
+ 
+go_pathways <- split(go_bp$entrez_gene, go_bp$gs_name)
+```
+
+#-----------------------------------------
+# fgsea per module using kME ranking
+#-----------------------------------------
+```{r}
+run_fgsea_for_module <- function(module_color) {
+ 
+  kme_col <- paste0("kME", module_color)
+ 
+  if (!kme_col %in% colnames(datKME)) return(NULL)
+ 
+  #--------------------------------------------------
+
+  # Build ranked SOMAmer list
+
+  #--------------------------------------------------
+
+  rank_df <- data.frame(
+
+    SOMAmer = rownames(datKME),
+
+    kME     = datKME[, kme_col]
+
+  ) %>%
+
+    filter(!is.na(kME)) %>%
+
+    arrange(desc(kME))
+ 
+  #--------------------------------------------------
+
+  # Map SOMAmer → SYMBOL → ENTREZ
+
+  #--------------------------------------------------
+
+  rank_df <- rank_df %>%
+
+    left_join(feature_key, by = "SOMAmer") %>%
+
+    left_join(map_all, by = "SYMBOL") %>%
+
+    filter(!is.na(ENTREZID)) %>%
+
+    distinct(ENTREZID, .keep_all = TRUE)
+ 
+  if (nrow(rank_df) < 50) return(NULL)
+ 
+  #--------------------------------------------------
+
+  # Create ranked vector
+
+  #--------------------------------------------------
+
+  gene_ranks <- rank_df$kME
+
+  names(gene_ranks) <- rank_df$ENTREZID
+
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+ 
+  #--------------------------------------------------
+
+  # Run fgsea
+
+  #--------------------------------------------------
+  
+  fg <- fgseaMultilevel(
+  pathways     = go_sets,
+  stats        = gene_ranks,
+  minSize      = 15,
+  maxSize      = 500,
+  nPermSimple  = 10000,   # handles unbalanced pathways
+  eps          = 0,
+  nproc        = 1        # 🔥 prevents serialize() crashes
+)
+  
+  fg
+
+}
+
+ 
+```
+
+
+```{r}
+library(msigdbr)
+ 
+msig_go <- msigdbr(
+  species = "Homo sapiens",
+  category = "C5",
+  subcategory = "BP"
+)
+ 
+go_sets <- split(msig_go$entrez_gene, msig_go$gs_name)
+ 
+# Restrict to universe
+go_sets <- lapply(go_sets, intersect, universe_entrez)
+go_sets <- go_sets[sapply(go_sets, length) >= 15]
+```
+
+
+
+
+
+
+
+
+#-----------------------------------------
+# Run fgsea across modules
+#-----------------------------------------
+```{r}
+fgsea_results <- list()
+ 
+for (mod in modules_to_export) {
+ 
+  fg <- run_fgsea_for_module(mod)
+ 
+  if (!is.null(fg)) {
+    fgsea_results[[mod]] <- fg %>%
+      arrange(padj) %>%
+      filter(padj < 0.05)
+  }
+}
+```
+
+#-----------------------------------------
+# Save fgsea results
+#-----------------------------------------
+```{r}
+ fgsea_dir <- file.path(functional_dir, "fgsea")
+ dir.create(fgsea_dir, showWarnings = FALSE)
+ 
+for (mod in names(fgsea_results)) {
+ 
+  write_csv(
+    fgsea_results[[mod]],
+    file.path(fgsea_dir, paste0("fgsea_GO_BP_", mod, ".csv"))
+  )
+}
+```
+
+
+```{r}
+plot_fgsea_for_module <- function(fgsea_df, module_color) {
+ 
+  top_terms <- fgsea_df %>% head(15)
+ 
+  ggplot(top_terms,
+         aes(x = NES, y = reorder(pathway, NES))) +
+    geom_point(aes(size = -log10(padj), color = NES)) +
+    theme_bw() +
+    labs(
+      title = paste("fgsea GO-BP – Module", module_color),
+      x = "Normalized Enrichment Score",
+      y = "GO Biological Process"
+    )
+}
+```
+
+
+```{r}
+for (mod in names(fgsea_results)) {
+ 
+  p <- plot_fgsea_for_module(fgsea_results[[mod]], mod)
+ 
+  ggsave(
+    file.path(fgsea_dir, paste0("fgsea_", mod, ".png")),
+    p, width = 10, height = 7
+  )
+}
+```
+
+
+#-----------------------------------------
+#               FGSEA - Using Hallmark
+#-----------------------------------------
+```{r}
+library(dplyr)
+library(fgsea)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+```
+
+```{r}
+all_features <- colnames(expr)
+ 
+feature_key <- analyte_info %>%
+  dplyr::filter(Analytes %in% all_features) %>%
+  dplyr::select(Analytes, EntrezGeneSymbol) %>%
+  dplyr::distinct() %>%
+  dplyr::rename(
+    SOMAmer = Analytes,
+    SYMBOL  = EntrezGeneSymbol
+  )
+ 
+map_all <- bitr(
+  feature_key$SYMBOL,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE)
+ 
+universe_entrez <- map_all$ENTREZID
+
+feature_map <- feature_key %>%
+  inner_join(map_all, by = "SYMBOL")
+```
+
+```{r}
+stopifnot(all(colnames(expr) == names(moduleColors)))
+ 
+datKME <- as.data.frame(
+  cor(expr, MEs, use = "p")
+)
+ 
+colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
+rownames(datKME) <- colnames(expr)
+```
+
+```{r}
+hallmark_df <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+)
+ 
+hallmark_sets <- hallmark_df %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+```
+
+
+```{r}
+reactome_df <- msigdbr(
+  species = "Homo sapiens",
+  category = "C2",
+  subcategory = "CP:REACTOME"
+)
+ 
+reactome_sets <- reactome_df %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+```
+
+
+```{r}
+reactome_df <- msigdbr(
+
+  species = "Homo sapiens",
+  category = "C2",
+  subcategory = "CP:REACTOME"
+)
+ 
+reactome_sets <- reactome_df %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+
+ 
+run_fgsea_for_module <- function(module,
+                                 pathway_sets,
+                                 minSize = 15,
+                                 maxSize = 500) {
+ 
+  kme_col <- paste0("kME_", module)
+ 
+  if (!kme_col %in% colnames(datKME)) {
+    message("Skipping module ", module, ": kME not found")
+    return(NULL)
+  }
+ 
+  rank_df <- data.frame(
+    SOMAmer = rownames(datKME),
+    kME = datKME[, kme_col]
+  ) %>%
+
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(!is.na(kME), !is.na(ENTREZID)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+ 
+  gene_ranks <- rank_df$kME
+  names(gene_ranks) <- rank_df$ENTREZID
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+ 
+  fg <- fgseaMultilevel(
+  pathways     = go_sets,
+  stats        = gene_ranks,
+  minSize      = 15,
+  maxSize      = 500,
+  nPermSimple  = 10000,   # handles unbalanced pathways
+  eps          = 0,
+  nproc        = 1        # prevents serialize() crashes
+)
+}
+ 
+```
+
+
+
+```{r}
+fgsea_results <- list()
+ 
+for (mod in modules_to_export) {
+  fg <- run_fgsea_for_module(
+    module = mod,
+    pathway_sets = hallmark_sets
+  )
+ 
+  if (!is.null(fg)) {
+    fgsea_results[[mod]] <- fg %>%
+      arrange(padj)
+  }
+}
+```
+```{r}
+fgsea_results <- list()
+ 
+for (mod in modules_to_export) {
+  fg <- run_fgsea_for_module(
+    module = mod,
+    pathway_sets = reactome_sets
+  )
+ 
+  if (!is.null(fg)) {
+    fgsea_results[[mod]] <- fg %>%
+      arrange(padj)
+  }
+}
+```
+
+```{r}
+plot_fgsea_dot <- function(fg, module_name) {
+ 
+  fg %>%
+    filter(padj < 0.05) %>%
+    ggplot(aes(
+      x = NES,
+      y = reorder(pathway, NES),
+      size = -log10(padj),
+      color = NES
+    )) +
+    geom_point() +
+    scale_color_gradient2(
+      low = "blue", mid = "white", high = "red"
+    ) +
+    theme_bw() +
+    labs(
+      title = paste("fgsea – Module", module_name),
+      y = "Pathway",
+      x = "Normalized Enrichment Score (NES)"
+    )
+}
+```
+
+```{r}
+plot_fgsea_dot(fgsea_results[["blue"]], "blue")
+```
+
+
+```{r}
+prep_fgsea <- function(fg, source) {
+  fg %>%
+    filter(padj < 0.05) %>%
+    select(pathway, NES) %>%
+    mutate(Source = source)
+}
+```
+
+```{r}
+# Define the helper function if you haven't already
+prep_fgsea <- function(fg_res, source_label) {
+  if (is.null(fg_res) || nrow(fg_res) == 0) return(NULL)
+  fg_res %>%
+    as_tibble() %>%
+    filter(padj < 0.05) %>%
+    dplyr::select(pathway, NES, padj) %>%
+    mutate(Source = source_label)
+}
+ 
+# List of your result objects and their corresponding labels
+result_lists <- list(
+  "Hallmark" = hallmark_sets,
+  "Reactome" = reactome_sets,
+  "GO"       = go_sets
+)
+ 
+# Combine for the "blue" module automatically
+target_module <- "blue"
+ 
+combined_fgsea <- lapply(names(result_lists), function(label) {
+  res_list <- result_lists[[label]]
+  prep_fgsea(res_list[[target_module]], label)
+}) %>% 
+  bind_rows()
+```
+
+
+
+```{r}
+colnames(result_lists[[1]])
+```
+```{r}
+names(result_lists)
+summary(result_lists[[1]]$padj)
+str(result_lists, max.level = 2)
+```
+
+
+
+
+```{r}
+# Initialize a structured results list
+# Structure: gsea_db_results$Database$Module
+gsea_db_results <- list(
+  "Hallmark" = list(),
+  "Reactome" = list(),
+  "GO_BP"    = list()
+)
+ 
+# Run GSEA for each database across all modules
+for (mod in modules_to_export) {
+  # Run Hallmark
+  gsea_db_results$Hallmark[[mod]] <- run_fgsea_for_module(mod, hallmark_sets)
+  # Run Reactome
+  gsea_db_results$Reactome[[mod]] <- run_fgsea_for_module(mod, reactome_sets)
+  # Run GO_BP
+  gsea_db_results$GO_BP[[mod]] <- run_fgsea_for_module(mod, go_sets)
+}
+```
+
+
+```{r}
+save_gsea_by_database <- function(results_object, 
+                                  outdir = file.path(functional_dir, "fgsea"), 
+                                  padj_cutoff = 0.05) {
+  if (!dir.exists(outdir)) {
+    dir.create(outdir, recursive = TRUE)
+  }
+ 
+  for (src in names(results_object)) {
+    wb <- createWorkbook()
+    cat("Processing Database:", src, "\n")
+    module_data <- results_object[[src]]
+    # Check if this database has any modules at all
+    if (length(module_data) == 0) {
+      cat("No results found for", src, "- skipping.\n")
+      next
+    }
+ 
+    for (mod in names(module_data)) {
+      df <- module_data[[mod]]
+      # Skip if NULL or empty
+      if (is.null(df) || nrow(df) == 0) next
+      # Filter by significance
+      df <- df %>% filter(padj < padj_cutoff)
+      if (nrow(df) > 0) {
+        # Convert leadingEdge list-column to string so it can be saved in Excel
+        if ("leadingEdge" %in% colnames(df)) {
+          df$leadingEdge <- sapply(df$leadingEdge, paste, collapse = ", ")
+        }
+        # Add worksheet and write data
+        addWorksheet(wb, mod)
+        writeData(wb, mod, df)
+      }
+    }
+    # Only save if the workbook actually has sheets
+    if (length(names(wb)) > 0) {
+      file_path <- file.path(outdir, paste0("ORA_", src, "_Results.xlsx"))
+      saveWorkbook(wb, file = file_path, overwrite = TRUE)
+      cat("Saved:", file_path, "\n")
+    } else {
+      cat("No significant results for", src, "to save.\n")
+    }
+  }
+  cat("Finished exporting results.\n")
+}
+```
+
+
+
+```{r}
+# Call the function with the results object
+save_gsea_by_database(gsea_db_results)
+```
+
+
+#==============================================================
+# Save GSEA Results Separately Per Database
+#==============================================================
+```{r}
+library(openxlsx)
+library(dplyr)
+ 
+save_gsea_by_database <- function(result_lists,
+                                  outdir = file.path(functional_dir, "fgsea"),
+                                  padj_cutoff = 0.05) {
+  if (!dir.exists(outdir)) {
+    dir.create(outdir, recursive = TRUE)
+  }
+  # Loop over databases directly
+  for (src in names(result_lists)) {
+    wb <- createWorkbook()
+    cat("Creating workbook for:", src, "\n")
+    module_list <- result_lists[[src]]
+    for (mod in names(module_list)) {
+      df <- module_list[[mod]]
+      # Skip if NULL
+      if (is.null(df)) next
+      # Make sure it's a dataframe
+      df <- as.data.frame(df)
+      # Detect correct p-value column
+      pcol <- if ("padj" %in% colnames(df)) {
+        "padj"
+      } else if ("p.adjust" %in% colnames(df)) {
+        "p.adjust"
+      } else {
+        next
+      }
+      df <- df[df[[pcol]] < padj_cutoff, ]
+      if (nrow(df) > 0) {
+        addWorksheet(wb, mod)
+        writeData(wb, mod, df)
+      }
+    }
+    saveWorkbook(
+      wb,
+      file = paste0(outdir, "ORA_", src, "_Results.xlsx"),
+      overwrite = TRUE
+    )
+  }
+  cat("Finished exporting database-specific GSEA results.\n")
+}
+
+```
+
+```{r}
+save_gsea_by_database(result_lists)
+```
+

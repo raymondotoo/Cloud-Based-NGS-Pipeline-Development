@@ -1,0 +1,322 @@
+---
+title: "04_Functional_Analysis (fixed)"
+author: "automated-patch"
+date: "2026-03-04"
+output: pdf_document
+---
+
+# Setup and Libraries
+
+```{r setup, include=FALSE}
+library(here)
+base_dir <- here::here("Proteomics")
+knitr::opts_knit$set(root.dir = base_dir)
+
+# Ensure directories exist
+results_dir <- file.path(base_dir, "results", "functional_analysis")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r libs, message=FALSE, warning=FALSE}
+pkgs <- c("WGCNA", "dplyr", "readr", "clusterProfiler", "org.Hs.eg.db", 
+          "enrichplot", "ReactomePA", "ggplot2", "openxlsx", "fgsea", "msigdbr")
+
+# Install missing packages first
+for(pk in pkgs){
+  if(!requireNamespace(pk, quietly = TRUE)){
+    message("Installing missing package: ", pk)
+    if(pk %in% c("WGCNA", "clusterProfiler", "org.Hs.eg.db", "enrichplot", "ReactomePA", "fgsea", "msigdbr")){
+      if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(pk, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pk)
+    }
+  }
+}
+
+# Load packages after ensuring all are installed
+for(pk in pkgs){
+  library(pk, character.only = TRUE)
+}
+options(stringsAsFactors = FALSE)
+```
+
+# Load Data
+
+```{r load-data}
+# Load WGCNA outputs
+wgcna_file <- file.path(base_dir, "results", "wgcna", "WGCNA2_core_outputs.RData")
+if(!file.exists(wgcna_file)) stop("WGCNA output not found at: ", wgcna_file)
+load(wgcna_file)
+
+# Check loaded objects
+if(!exists("expr") || !exists("moduleColors")) stop("WGCNA objects 'expr' or 'moduleColors' missing.")
+stopifnot(colnames(expr) == names(moduleColors))
+
+# Load Annotation
+analyte_file <- file.path(base_dir, "data", "CSF_SOMAscan7k_analyte_information.tsv")
+if(!file.exists(analyte_file)) stop("Analyte annotation not found: ", analyte_file)
+analyte_info <- read.delim(analyte_file, sep = "\t", header = TRUE, check.names = FALSE)
+
+# Load Background (optional, but good for ORA)
+bg_file <- file.path(base_dir, "data", "background_soma.csv")
+if(file.exists(bg_file)){
+  background <- read.csv(bg_file)
+  background_soma <- background$EntrezGeneSymbol
+} else {
+  message("Background file not found, using all proteins in expr as background.")
+  background_soma <- NULL
+}
+```
+
+# ID Mapping (SOMAmer -> SYMBOL -> ENTREZ)
+
+```{r id-mapping}
+all_features <- colnames(expr)
+
+feature_key <- analyte_info %>%
+  dplyr::filter(Analytes %in% all_features) %>%
+  dplyr::select(Analytes, EntrezGeneSymbol) %>%
+  dplyr::distinct() %>%
+  dplyr::rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+
+# Map to Entrez
+map_all <- bitr(
+  feature_key$SYMBOL,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE)
+
+feature_map <- feature_key %>%
+  dplyr::inner_join(map_all, by = "SYMBOL")
+
+universe_entrez <- unique(feature_map$ENTREZID)
+message("Mapped ", length(universe_entrez), " unique Entrez IDs from ", length(all_features), " SOMAmers.")
+```
+
+# Export Module Gene Lists
+
+```{r export-modules}
+modules_to_export <- setdiff(unique(moduleColors), "grey")
+
+# 1. Long format CSV
+module_gene_list <- list()
+for (mod in modules_to_export) {
+  somamers <- colnames(expr)[moduleColors == mod]
+  module_df <- feature_map %>%
+    dplyr::filter(SOMAmer %in% somamers) %>%
+    dplyr::mutate(Module = mod) %>%
+    dplyr::select(Module, SOMAmer, SYMBOL, ENTREZID)
+  module_gene_list[[mod]] <- module_df
+}
+final_gene_list_df <- bind_rows(module_gene_list)
+write_csv(final_gene_list_df, file.path(results_dir, "Module_Gene_Lists.csv"))
+
+# 2. Column-wise Excel
+module_gene_vectors <- lapply(modules_to_export, function(mod) {
+  somamers <- colnames(expr)[moduleColors == mod]
+  feature_map %>%
+    filter(SOMAmer %in% somamers) %>%
+    pull(SYMBOL) %>%
+    unique()
+})
+names(module_gene_vectors) <- modules_to_export
+
+max_len <- max(lengths(module_gene_vectors))
+padded <- lapply(module_gene_vectors, function(x) c(x, rep(NA, max_len - length(x))))
+final_transposed_df <- as.data.frame(padded)
+write.xlsx(final_transposed_df, file.path(results_dir, "Module_Genes_Columnwise.xlsx"), overwrite = TRUE)
+```
+
+# GO Enrichment (ORA)
+
+```{r go-ora}
+plot_go_for_module <- function(module_color) {
+  somamers <- colnames(expr)[moduleColors == module_color]
+  entrez <- feature_map %>%
+    filter(SOMAmer %in% somamers) %>%
+    pull(ENTREZID) %>%
+    unique()
+
+  if (length(entrez) < 5) return(NULL)
+
+  go_res <- lapply(c("BP", "MF", "CC"), function(ont) {
+    ego <- enrichGO(
+      gene = entrez,
+      universe = universe_entrez,
+      OrgDb = org.Hs.eg.db,
+      keyType = "ENTREZID",
+      ont = ont,
+      pAdjustMethod = "BH",
+      qvalueCutoff = 0.1,
+      readable = TRUE
+    )
+    if (is.null(ego) || nrow(ego@result) == 0) return(NULL)
+    
+    ego@result %>%
+      filter(p.adjust <= 0.1) %>%
+      arrange(p.adjust) %>%
+      head(5) %>%
+      mutate(Ontology = ont)
+  })
+
+  go_df <- bind_rows(go_res)
+  if (nrow(go_df) == 0) return(NULL)
+
+  p <- ggplot(go_df, aes(GeneRatio, Description)) +
+    geom_point(aes(size = Count, color = p.adjust)) +
+    facet_grid(Ontology ~ ., scales = "free_y") +
+    scale_color_gradient(low = "red", high = "blue") +
+    theme_bw() +
+    labs(title = paste("GO Enrichment – Module", module_color))
+  return(p)
+}
+
+dir.create(file.path(results_dir, "GO_plots"), showWarnings = FALSE)
+for (mod in modules_to_export) {
+  p <- plot_go_for_module(mod)
+  if (!is.null(p)) {
+    ggsave(file.path(results_dir, "GO_plots", paste0("GO_", mod, ".png")), p, width = 10, height = 8)
+  }
+}
+```
+
+# GSEA (fgsea) Setup
+
+```{r gsea-setup}
+# 1. Calculate kME (Module Membership)
+datKME <- as.data.frame(cor(expr, MEs, use = "p"))
+colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
+rownames(datKME) <- colnames(expr)
+
+# 2. Prepare Gene Sets
+msig_go <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+go_sets <- split(msig_go$entrez_gene, msig_go$gs_name)
+
+msig_h <- msigdbr(species = "Homo sapiens", category = "H")
+hallmark_sets <- split(msig_h$entrez_gene, msig_h$gs_name)
+
+msig_reactome <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactome_sets <- split(msig_reactome$entrez_gene, msig_reactome$gs_name)
+
+# Filter sets to universe (optional but recommended)
+filter_sets <- function(sets, universe) {
+  lapply(sets, intersect, universe) %>% .[sapply(., length) >= 10]
+}
+go_sets <- filter_sets(go_sets, universe_entrez)
+hallmark_sets <- filter_sets(hallmark_sets, universe_entrez)
+reactome_sets <- filter_sets(reactome_sets, universe_entrez)
+
+gene_set_list <- list(
+  "GO_BP" = go_sets,
+  "Hallmark" = hallmark_sets,
+  "Reactome" = reactome_sets
+)
+```
+
+# Run GSEA
+
+```{r run-gsea}
+run_fgsea_for_module <- function(module, pathway_sets) {
+  kme_col <- paste0("kME_", module)
+  if (!kme_col %in% colnames(datKME)) return(NULL)
+
+  # Rank by kME
+  rank_df <- data.frame(SOMAmer = rownames(datKME), kME = datKME[, kme_col]) %>%
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(!is.na(kME), !is.na(ENTREZID)) %>%
+    distinct(ENTREZID, .keep_all = TRUE) %>%
+    arrange(desc(kME))
+
+  if (nrow(rank_df) < 50) return(NULL)
+
+  gene_ranks <- rank_df$kME
+  names(gene_ranks) <- rank_df$ENTREZID
+
+  fg <- fgseaMultilevel(
+    pathways = pathway_sets,
+    stats = gene_ranks,
+    minSize = 10,
+    maxSize = 500,
+    eps = 0,
+    nproc = 1 # Avoid parallel issues in RStudio/some envs
+  )
+  return(fg)
+}
+
+# Run for all combinations
+gsea_results <- list()
+
+for (db_name in names(gene_set_list)) {
+  message("Running GSEA for ", db_name, "...")
+  gsea_results[[db_name]] <- list()
+  
+  for (mod in modules_to_export) {
+    res <- run_fgsea_for_module(mod, gene_set_list[[db_name]])
+    if (!is.null(res) && nrow(res) > 0) {
+      gsea_results[[db_name]][[mod]] <- res %>% arrange(padj)
+    }
+  }
+}
+```
+
+# Save GSEA Results
+
+```{r save-gsea}
+save_gsea_excel <- function(results_list, out_dir) {
+  for (db_name in names(results_list)) {
+    wb <- createWorkbook()
+    mod_list <- results_list[[db_name]]
+    
+    saved_any <- FALSE
+    for (mod in names(mod_list)) {
+      df <- as.data.frame(mod_list[[mod]])
+      # Filter significant
+      df_sig <- df %>% filter(padj < 0.05)
+      
+      if (nrow(df_sig) > 0) {
+        # Flatten list columns for Excel
+        if ("leadingEdge" %in% colnames(df_sig)) {
+          df_sig$leadingEdge <- sapply(df_sig$leadingEdge, paste, collapse = ", ")
+        }
+        addWorksheet(wb, mod)
+        writeData(wb, mod, df_sig)
+        saved_any <- TRUE
+      }
+    }
+    
+    if (saved_any) {
+      fname <- file.path(out_dir, paste0("GSEA_", db_name, "_Results.xlsx"))
+      saveWorkbook(wb, fname, overwrite = TRUE)
+      message("Saved: ", fname)
+    }
+  }
+}
+
+save_gsea_excel(gsea_results, results_dir)
+```
+
+# Plot GSEA
+
+```{r plot-gsea}
+dir.create(file.path(results_dir, "GSEA_plots"), showWarnings = FALSE)
+
+for (db_name in names(gsea_results)) {
+  for (mod in names(gsea_results[[db_name]])) {
+    res <- gsea_results[[db_name]][[mod]]
+    top_res <- res %>% filter(padj < 0.05) %>% head(15)
+    
+    if (nrow(top_res) > 0) {
+      p <- ggplot(top_res, aes(x = NES, y = reorder(pathway, NES), size = -log10(padj), color = NES)) +
+        geom_point() +
+        scale_color_gradient2(low = "blue", mid = "white", high = "red") +
+        theme_bw() +
+        labs(title = paste(db_name, "– Module", mod), y = "Pathway", x = "NES")
+      
+      ggsave(file.path(results_dir, "GSEA_plots", paste0("GSEA_", db_name, "_", mod, ".png")), p, width = 10, height = 7)
+    }
+  }
+}
+```

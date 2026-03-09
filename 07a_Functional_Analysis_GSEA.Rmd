@@ -1,0 +1,708 @@
+---s
+title: "funct_new"
+author: "Raymond Otoo"
+date: "2026-02-10"
+output: pdf_document
+---
+
+#=====================================================================================
+#                             Functional Analysis/Network Analysis - Summary of the Workflow
+#
+# 1.Annotation: Maps SOMAmers to Entrez IDs.
+# 2.Ranking: Uses WGCNA kME values to rank every protein in every module.
+# 3.Enrichment: Runs fgseaMultilevel against three distinct databases (Hallmark, Reactome, GO).
+# 4.Integration: Combines them into a single data structure.
+# 5.Visualization: Creates heatmaps to compare modules and faceted dot plots to inspect individual modules.
+#=====================================================================================
+
+
+#==============================================================
+# 1. Setup
+#==============================================================
+```{r}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+gsea_dir <- paths$gsea_dir
+gsea_plots_dir <- file.path(gsea_dir, "plots")
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(dplyr)
+  library(readr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(ggplot2)
+  library(openxlsx)
+  library(fgsea)
+  library(msigdbr)
+  library(tidyr)
+  library(tibble)
+  library(pheatmap)
+})
+
+dir.create(gsea_plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+
+#==============================================================
+# 2. Load WGCNA Results
+#==============================================================
+```{r}
+# Loads previously saved r object froom WGCNA containing results:
+# expr, moduleColors, MEs
+load(file.path(paths$wgcna_dir, "WGCNA2_core_outputs.RData"))
+
+```
+
+
+```{r}
+# Make sure names are correct
+if (is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
+stopifnot(identical(colnames(expr), names(moduleColors)))
+ 
+# List of modules (excluding grey)
+modules <- setdiff(unique(moduleColors), "grey")
+ 
+# Compute kME
+datKME <- cor(expr, MEs, use = "p")
+datKME <- as.data.frame(datKME)
+colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
+rownames(datKME) <- colnames(expr)
+```
+
+
+#==============================================================
+# 3. Annotation Mapping
+#==============================================================
+```{r}
+# Load feature information
+analyte_info <- read.delim(
+  file.path(paths$data_dir, "CSF_SOMAscan7k_analyte_information.tsv"),
+  sep = "\t",
+  header = TRUE,
+  check.names = FALSE
+)
+ 
+# Keep only overlapping SOMAmers
+feature_key <- analyte_info %>%
+  dplyr::filter(Analytes %in% colnames(expr)) %>%
+  dplyr::select(Analytes, EntrezGeneSymbol) %>%
+  dplyr::distinct() %>%
+  dplyr::rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+ 
+# Map SYMBOL → ENTREZID
+symbol_map <- clusterProfiler::bitr(
+  feature_key$SYMBOL,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>% distinct(SYMBOL, .keep_all = TRUE)
+ 
+# Join to get final mapping
+feature_map <- inner_join(feature_key, symbol_map, by = "SYMBOL")
+ 
+cat("Number of mapped genes:", nrow(feature_map), "\n")
+```
+
+```{r}
+nrow(feature_key)
+nrow(feature_map)
+head(analyte_info$Analytes)
+```
+```{r}
+dim(expr)
+dim(MEs)
+```
+
+#==============================================================
+# 4. Load Gene Sets
+#==============================================================
+```{r}
+library(msigdbr)
+ 
+# 1. Download the gene sets
+hm <- msigdbr(species = "Homo sapiens", category = "H")
+react <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+go <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+ 
+# 2. Build pathway lists with proper names
+hallmark_sets <- split(hm$entrez_gene, as.character(hm$gs_name))
+reactome_sets <- split(react$entrez_gene, as.character(react$gs_name))
+go_sets <- split(go$entrez_gene, as.character(go$gs_name))
+ 
+# 3. Check
+length(hallmark_sets)      # should be ~50 for Hallmark
+head(names(hallmark_sets)) # descriptive names
+length(reactome_sets)
+head(names(reactome_sets))
+length(go_sets)
+head(names(go_sets))
+```
+
+
+#==============================================================
+# 5. GSEA Function
+#==============================================================
+```{r}
+run_fgsea_module <- function(module, pathway_sets) {
+
+  kme_col <- paste0("kME_", module)
+
+  module_genes <- names(moduleColors[moduleColors == module])
+
+  ranks_df <- data.frame(
+    SOMAmer = rownames(datKME),
+    kME = datKME[, kme_col]
+  ) %>%
+    filter(SOMAmer %in% module_genes) %>%
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(is.finite(kME)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+
+  if (nrow(ranks_df) < 15) return(NULL)
+
+  gene_ranks <- ranks_df$kME
+  names(gene_ranks) <- ranks_df$ENTREZID
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+
+  fgseaMultilevel(
+    pathways = pathway_sets,
+    stats = gene_ranks,
+    minSize = 5,
+    maxSize = 500,
+    scoreType = "pos",
+    nproc = 1 #force single-threaded
+  )
+}
+
+```
+
+
+#check how many Module genes map to entrez sets
+```{r}
+# For each module, count mapped genes
+module_gene_counts <- sapply(modules, function(mod) {
+  module_genes <- names(moduleColors[moduleColors == mod])
+  mapped_genes <- feature_map$ENTREZID[feature_map$SOMAmer %in% module_genes]
+  length(unique(mapped_genes))
+})
+ 
+module_gene_counts
+```
+
+## Run Unit Test for one mudule
+```{r}
+library(dplyr)
+library(fgsea)
+ 
+# Pick a large module, e.g., "green"
+mod <- "green"
+kme_col <- paste0("kME_", mod)
+module_genes <- names(moduleColors[moduleColors == mod])
+ 
+ranks_df <- data.frame(
+  SOMAmer = rownames(datKME),
+  kME = datKME[, kme_col]
+) %>%
+  filter(SOMAmer %in% module_genes) %>%
+  inner_join(feature_map, by = "SOMAmer") %>%
+  filter(is.finite(kME)) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+ 
+gene_ranks <- ranks_df$kME
+names(gene_ranks) <- ranks_df$ENTREZID
+gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+ 
+# Run a test GSEA with Hallmark
+fg_test <- fgseaMultilevel(
+  pathways = hallmark_sets,
+  stats = gene_ranks,
+  minSize = 5,
+  maxSize = 500,
+  scoreType = "pos",
+  nproc = 1 #force single-threaded
+)
+ 
+fg_test %>% arrange(padj) %>% head()
+```
+
+
+#==============================================================
+# 6. Run GSEA test for modules to check if all functions are working correctly
+#==============================================================
+```{r}
+library(fgsea)
+library(dplyr)
+ 
+# Use scoreType = "pos" because kME values are all positive
+score_type <- "pos"
+ 
+# Loop through all modules
+for (mod in modules) {
+ 
+  cat("\n====================\n")
+  cat("Module:", mod, "\n")
+  # Genes in this module
+  module_genes <- names(moduleColors[moduleColors == mod])
+  # Only keep mapped genes
+  ranks_df <- data.frame(
+    SOMAmer = rownames(datKME),
+    kME = datKME[, paste0("kME_", mod)]
+  ) %>%
+    filter(SOMAmer %in% module_genes) %>%
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(is.finite(kME)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+  cat("Mapped genes in module:", nrow(ranks_df), "\n")
+  # Skip if too few genes
+  if (nrow(ranks_df) < 15) {
+    cat("Skipping module: less than 15 genes\n")
+    next
+  }
+  # Build ranks
+  gene_ranks <- ranks_df$kME
+  names(gene_ranks) <- ranks_df$ENTREZID
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+  # Run GSEA test for Hallmark (as example)
+  fg_test <- fgseaMultilevel(
+    pathways = hallmark_sets,
+    stats = gene_ranks,
+    minSize = 5,
+    maxSize = 500,
+    scoreType = score_type,
+    nproc = 1 #force single-threaded
+  )
+  cat("Total pathways tested:", nrow(fg_test), "\n")
+  cat("Significant pathways (padj < 0.05):", sum(fg_test$padj < 0.05), "\n")
+  # Optional: print top 3 pathways by NES
+  if(nrow(fg_test) > 0){
+    print(fg_test %>% arrange(padj) %>% head(3))
+  }
+}
+```
+
+
+#==============================================================
+# 7. Run GSEA Across All Modules
+#==============================================================
+```{r}
+all_gsea_results <- list()
+ 
+for (mod in modules) {
+  cat("Processing module:", mod, "\n")
+  h <- run_fgsea_module(mod, hallmark_sets)
+  r <- run_fgsea_module(mod, reactome_sets)
+  g <- run_fgsea_module(mod, go_sets)
+ 
+  combined <- bind_rows(
+    if (!is.null(h)) as_tibble(h) %>% mutate(Source = "Hallmark"),
+    if (!is.null(r)) as_tibble(r) %>% mutate(Source = "Reactome"),
+    if (!is.null(g)) as_tibble(g) %>% mutate(Source = "GO_BP")
+  )
+ 
+  if (!is.null(combined) && nrow(combined) > 0) {
+    all_gsea_results[[mod]] <- combined
+  } else {
+    cat("Module", mod, "has no significant GSEA results\n")
+  }
+}
+
+```
+
+
+#==============================================================
+# 8. Multi-Module Heatmap
+#==============================================================
+```{r}
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+ 
+# List of sources
+sources <- c("Hallmark", "Reactome", "GO_BP")
+ 
+for (src in sources) {
+ 
+  # Combine results for this source
+  combined_df <- bind_rows(
+    lapply(names(all_gsea_results), function(m) {
+      all_gsea_results[[m]] %>%
+        dplyr::filter(Source == src, padj < 0.05) %>%
+        dplyr::mutate(Module = m) %>%
+        dplyr::select(pathway, NES, Module)
+    })
+  )
+ 
+  if (nrow(combined_df) > 1) {
+    heatmap_mat <- combined_df %>%
+      distinct(pathway, Module, .keep_all = TRUE) %>%
+      pivot_wider(names_from = Module, values_from = NES) %>%
+      column_to_rownames("pathway") %>%
+      mutate(across(everything(), ~replace_na(.x, 0)))
+ 
+    # Auto-scale height: 0.3 inch per pathway row (adjust factor if needed)
+    n_rows <- nrow(heatmap_mat)
+    width_in <- max(12, ncol(heatmap_mat) * 1)         # 1 inch per module minimum 12
+    height_in <- max(6, n_rows * 0.3)                 # 0.3 inch per pathway row
+ 
+    # Save PDF for infinite resolution (recommended for large heatmaps)
+    pdf(
+      file = file.path(gsea_plots_dir, paste0("Heatmap_", src, ".pdf")),
+      width = width_in,
+      height = height_in
+    )
+ 
+    pheatmap(
+      as.matrix(heatmap_mat),
+      color = colorRampPalette(c("blue", "white", "red"))(100),
+      main = paste("Significant Pathway NES Across Modules -", src),
+      fontsize_row = 6,
+      fontsize_col = 10,
+      border_color = NA,
+      clustering_method = "ward.D2"
+    )
+ 
+    dev.off()
+    message("Saved heatmap for ", src, " with ", n_rows, " pathways.")
+ 
+  } else {
+    message("No significant pathways for source: ", src)
+
+  }
+}
+```
+
+
+#==============================================================
+# 9. Dot Plot Function
+#==============================================================
+```{r}
+library(stringr) # Essential for wrapping text
+ 
+plot_fgsea_module_source <- function(df, module_name, source_name) {
+  sig <- df %>% filter(Source == source_name, padj < 0.05)
+  if (nrow(sig) == 0) return(NULL)
+  # Pick top 10 by absolute NES
+  top_sig <- sig %>% 
+    slice_max(order_by = abs(NES), n = 10) %>%
+    mutate(
+      # 1. Clean up labels: remove prefixes like GO_BP_
+      clean_pathway = gsub("^(GO_BP_|HALLMARK_|REACTOME_)", "", pathway),
+      # 2. Replace underscores with spaces
+      clean_pathway = gsub("_", " ", clean_pathway),
+      # 3. Wrap long strings (limit to 40 characters per line)
+      clean_pathway = str_wrap(clean_pathway, width = 40)
+    )
+  ggplot(top_sig, aes(
+    x = NES,
+    y = reorder(clean_pathway, NES),
+    size = -log10(padj),
+    color = NES
+  )) +
+    # Add thin vertical line at 0
+    geom_vline(xintercept = 0, color = "grey70", linetype = "dashed") +
+    geom_point(alpha = 0.8) +
+    scale_color_gradient2(low = "#0571b0", mid = "#f7f7f7", high = "#ca0020") +
+    theme_minimal(base_size = 12) +
+    theme(
+      # Adjust y-axis text to prevent overlap
+      axis.text.y = element_text(lineheight = 0.8, color = "black"),
+      axis.title.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(face = "bold", size = 11, hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 10)
+    ) +
+    labs(
+      title = paste("Module:", module_name),
+      subtitle = paste("Database:", source_name),
+      x = "Normalized Enrichment Score (NES)",
+      color = "Enrichment\n(NES)",
+      size = "-log10(padj)"
+    )
+}
+ 
+# Loop and Save
+for (mod in names(all_gsea_results)) {
+  for (src in sources) {
+    p <- plot_fgsea_module_source(all_gsea_results[[mod]], mod, src)
+    if (!is.null(p)) {
+      # Path setup
+      file_path <- file.path(gsea_plots_dir, paste0("DotPlot_", mod, "_", src, ".pdf"))
+      # Use ggsave for better font handling
+      # Fixed aspect ratio usually looks better for journals
+      ggsave(
+        filename = file_path,
+        plot = p,
+        width = 8, 
+        height = 6, 
+        device = "pdf",
+        useDingbats = FALSE # Recommended for publication PDFs
+      )
+    }
+  }
+}
+```
+
+
+#==============================================================
+# 10. CNEt plot for all modules with all databases that were conmsidered
+#==============================================================
+```{r}
+library(enrichplot)
+library(stringr)
+ 
+plot_module_network_by_source <- function(df, module_name, source_name, n_pathways = 5) {
+  # 1. Filter for specific Source and significance
+  sig_res <- df %>% 
+    filter(Source == source_name, padj < 0.05) %>% 
+    slice_max(order_by = abs(NES), n = n_pathways)
+  if(nrow(sig_res) == 0) return(NULL)
+ 
+  # 2. Extract leading edge genes
+  # fgsea stores these as a list of Entrez IDs
+  gene_list <- sig_res$leadingEdge
+  # Clean pathway names for better labeling in the network
+  clean_names <- sig_res$pathway %>%
+    gsub("^(GO_BP_|HALLMARK_|REACTOME_)", "", .) %>%
+    gsub("_", " ", .) %>%
+    str_wrap(width = 20)
+  names(gene_list) <- clean_names
+  # 3. Map Entrez IDs to Symbols for readability
+  # Using your feature_map created earlier
+  id_to_symbol <- feature_map$SYMBOL
+  names(id_to_symbol) <- feature_map$ENTREZID
+  gene_list_symbols <- lapply(gene_list, function(x) {
+    symbols <- unname(id_to_symbol[as.character(x)])
+    return(symbols[!is.na(symbols)]) # Remove any NAs
+  })
+ 
+# 4. Create the Network Plot
+  p <- cnetplot(gene_list_symbols, 
+                showCategory = n_pathways,
+                layout = "circle", #options : gem, lgl, circle, defaut is "kk"
+                #node_label = "group", 
+                cex_label_gene = 0.7,      
+                cex_label_category = 0.9,  
+                colorEdge = TRUE,
+                color_edge="category",
+                shadowtext = "gene") +     
+    labs(title = paste("Module:", module_name, "| Database:", source_name),
+         subtitle = "Connections between top pathways and their leading-edge proteins") +
+    theme(
+      # Centering the title and subtitle
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5,margin = margin(b=30)),
+      # Add margins to prevent the nodes/labels from being cut off at the edges
+      # margin(top, right, bottom, left)
+      plot.margin = margin(20, 20, 20, 20) 
+    )
+ 
+  return(p)
+}
+```
+
+
+
+
+
+```{r}
+sources <- c("Hallmark", "Reactome", "GO_BP")
+ 
+for (mod in names(all_gsea_results)) {
+  for (src in sources) {
+    p_net <- plot_module_network_by_source(all_gsea_results[[mod]], mod, src)
+    if (!is.null(p_net)) {
+      # Create filename
+      net_filename <- file.path(gsea_plots_dir, paste0("Network_", mod, "_", src, ".pdf"))
+      # Save with a larger canvas to prevent label overlapping
+      
+      ggsave(
+        filename = net_filename,
+        plot = p_net,
+        width = 8, 
+        height = 6, 
+        device = "pdf",
+        useDingbats = FALSE # Recommended for publication PDFs
+      )
+      message("Saved network plot for Module: ", mod, " Source: ", src)
+    }
+  }
+}
+```
+
+
+#==============================================================
+# 11. Export Results 
+#==============================================================
+```{r}
+wb <- createWorkbook()
+
+for (mod in names(all_gsea_results)) {
+
+  df <- all_gsea_results[[mod]] %>%
+    filter(padj < 0.05) %>%
+    arrange(Source, padj)
+
+  if (nrow(df) > 0) {
+    addWorksheet(wb, mod)
+    writeData(wb, mod, df)
+  }
+}
+
+saveWorkbook(
+  wb,
+  file.path(gsea_dir, "Combined_GSEA_Results.xlsx"),
+  overwrite = TRUE
+)
+
+```
+
+
+#==============================================================
+# 11b. Database-specific GSEA results export
+#==============================================================
+```{r}
+#==============================================================
+# Save GSEA Results Separately Per Database
+#==============================================================
+ 
+library(openxlsx)
+library(dplyr)
+ 
+save_gsea_by_database <- function(all_gsea_results,
+                                  outdir = gsea_dir,
+                                  padj_cutoff = 0.05) {
+  # Ensure output directory exists
+  if (!dir.exists(outdir)) {
+    dir.create(outdir, recursive = TRUE)
+  }
+  # Identify all unique databases
+  all_sources <- unique(
+    unlist(lapply(all_gsea_results, function(x) x$Source))
+  )
+  for (src in all_sources) {
+    wb <- createWorkbook()
+    cat("Creating workbook for:", src, "\n")
+    for (mod in names(all_gsea_results)) {
+      df <- all_gsea_results[[mod]] %>%
+        filter(Source == src, padj < padj_cutoff) %>%
+        arrange(padj)
+      if (nrow(df) > 0) {
+        addWorksheet(wb, mod)
+        writeData(wb, mod, df)
+      }
+    }
+    saveWorkbook(
+      wb,
+      file = file.path(outdir, paste0("GSEA_", src, "_Results.xlsx")),
+      overwrite = TRUE
+    )
+  }
+  cat("Finished exporting database-specific GSEA results.\n")
+}
+
+
+save_gsea_by_database(all_gsea_results)
+```
+
+
+
+#==============================================================
+# 12. GSEA Running Score Plots (Mountain Plots)
+#==============================================================
+```{r}
+library(fgsea)
+library(ggplot2)
+# Ensure directory exists
+
+score_dir <- file.path(gsea_plots_dir, "GSEA_Scores")
+dir.create(score_dir, recursive = TRUE, showWarnings = FALSE)
+ 
+for (mod in names(all_gsea_results)) {
+
+  # 1. Reconstruct the rank vector for the specific module
+  kme_col <- paste0("kME_", mod)
+  module_genes <- names(moduleColors[moduleColors == mod])
+
+  ranks_df <- data.frame(
+    SOMAmer = rownames(datKME),
+    kME = datKME[, kme_col]
+
+  ) %>%
+
+    filter(SOMAmer %in% module_genes) %>%
+    inner_join(feature_map, by = "SOMAmer") %>%
+    filter(is.finite(kME)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+
+  if(nrow(ranks_df) == 0) next
+  gene_ranks <- ranks_df$kME
+  names(gene_ranks) <- ranks_df$ENTREZID
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+
+  # 2. Iterate through Hallmark, Reactome, and GO
+  for (src in sources) {
+    # Select the correct pathway list for the current source
+    current_sets <- switch(src,
+                           "Hallmark" = hallmark_sets,
+                           "Reactome" = reactome_sets,
+                           "GO_BP"    = go_sets)
+
+    # Get top 2 significant pathways for this source
+    top_paths <- all_gsea_results[[mod]] %>%
+      filter(Source == src, padj < 0.05) %>%
+      slice_min(order_by = padj, n = 2)
+
+    if (nrow(top_paths) == 0) next
+
+    for (i in 1:nrow(top_paths)) {
+      path_name <- top_paths$pathway[i]
+      stats <- top_paths[i, ] # Get stats for labeling
+
+      # 3. Create the Running Score Plot
+      p_mountain <- plotEnrichment(current_sets[[path_name]], gene_ranks) +
+        labs(
+          title = paste("Module:", mod, "-", src),
+          subtitle = str_wrap(path_name, width = 60),
+          caption = paste0("NES: ", round(stats$NES, 2), " | padj: ", format.pval(stats$padj, digits = 3))
+        ) +
+        
+        theme_bw() +
+        
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          plot.subtitle = element_text(hjust = 0.5, size = 10, margin = margin(b=10)),
+          plot.caption = element_text(hjust = 0.5, size = 11, face = "italic", color = "darkred"),
+          panel.grid.minor = element_blank(),
+          plot.margin = margin(20, 20, 20, 20)
+        )
+
+      # 4. Save the plot
+      # Use a safe filename
+      clean_path_name <- str_trunc(gsub("[^[:alnum:]]", "_", path_name), 30)
+      gsea_filename <- file.path(score_dir, paste0("Score_", mod, "_", src, "_", i, ".pdf"))
+
+      ggsave(
+        filename = gsea_filename,
+        plot = p_mountain,
+        width = 8,
+        height = 6,
+        device = "pdf",
+        useDingbats = FALSE
+      )
+    }
+  }
+}
+ 
+message("All GSEA Mountain plots have been saved to ", score_dir)
+```
+
+```{r}
+#install.packages("report")
+library(report)
+report::report_packages()
+```
+

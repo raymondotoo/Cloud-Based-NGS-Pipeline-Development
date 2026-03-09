@@ -1,0 +1,347 @@
+---
+title: "Data_preprocessing"
+author: "Raymond Otoo"
+date: "2026-1-26"
+output: pdf_document
+---
+
+
+#=====================================================================================
+#
+# 00- Set working directory
+#=====================================================================================
+```{r setup, include=FALSE}
+source("project_setup.R")
+paths <- init_project(knitr_root = TRUE)
+getwd()
+```
+
+
+#=====================================================================================
+#
+# 1. Read Protein Expression Matrix and Phenotype data
+#=====================================================================================
+```{r}
+#install.packages("openxlsx")
+library(openxlsx)
+
+#z-score noirmalized protein expression matrix
+ProtoData <- read.xlsx(file.path(paths$data_dir, "all_ADRC_ADNI_proteomics_samples_Zscore_soma_only.xlsx"))
+
+#phenotypic data
+PhenoInfo <- read.xlsx(file.path(paths$data_dir, "all_ADRC_ADNI_csfprot_wmhpheno_CLEAN_FINAL_10_24_2025.xlsx"))
+
+
+#load PCs 1-3
+pc_file <- file.path(paths$pca_dir, "WMH_PCA_scores_PC1_PC3.csv")
+if (!file.exists(pc_file)) {
+  pc_file <- file.path(paths$data_dir, "WMH_PCA_scores_PC1_PC3.csv")
+}
+pc1_3 <- read.csv(pc_file)
+```
+
+```{r}
+pc1_3
+```
+
+#Flip PC1 sign for interpretability
+```{r}
+pc1_3$PC1 <- -pc1_3$PC1
+
+pc1_3
+```    
+
+
+
+```{r}
+colnames(pc1_3)
+```
+
+
+```{r}
+PhenoInfo <- cbind(PhenoInfo, pc1_3[,2:4])
+PhenoInfo
+```
+```{r}
+colnames(PhenoInfo)
+```
+
+
+```{r}
+ProtoData
+PhenoInfo
+```
+
+
+```{r}
+#SOMA data only
+ProtoData <- subset(ProtoData, Panel.SOMA ==1)
+PhenoInfo <- subset(PhenoInfo, Panel.SOMA ==1)
+
+ProtoData
+PhenoInfo
+```
+
+#=====================================================================================
+#
+# 2. Handling missing Values - Missing value Imputation
+# remove peptides with too many missvalues (>90% samples)
+#=====================================================================================
+```{r}
+ProtoData[rowMeans(!is.na(ProtoData)) <0.9,]
+ProtoData
+```
+
+# Overall missing value count
+```{r}
+sum(is.na(ProtoData))
+```
+
+
+```{r}
+library(imputeLCMD)
+ 
+impute_with_metadata <- function(df, 
+                                 model.selector = 1, 
+                                 method.MAR = "MLE", 
+                                 method.MNAR = "QRILC") {
+  # 1. Split into metadata and numeric
+  metadata <- df[ , !sapply(df, is.numeric), drop = FALSE]
+  numeric_data <- df[ , sapply(df, is.numeric), drop = FALSE]
+
+  # 2. Convert to matrix
+  numeric_matrix <- as.matrix(numeric_data)
+  # 3. Drop all-NA columns
+  numeric_matrix <- numeric_matrix[, colSums(is.na(numeric_matrix)) < nrow(numeric_matrix), drop = FALSE]
+  # 4. Drop zero-variance columns
+  numeric_matrix <- numeric_matrix[, 
+                                   apply(numeric_matrix, 2, function(x) length(unique(na.omit(x))) > 1), 
+                                   drop = FALSE]
+  # 5. Impute missing values
+  numeric_imputed <- impute.MAR.MNAR(numeric_matrix,
+                                     model.selector = model.selector,
+                                     method.MAR = method.MAR,
+                                     method.MNAR = method.MNAR)
+  
+
+  # 6. Convert back to dataframe
+  numeric_imputed <- as.data.frame(numeric_imputed)
+  colnames(numeric_imputed) <- colnames(numeric_matrix)
+  # 7. Recombine metadata + imputed numeric data
+  result <- cbind(metadata, numeric_imputed)
+  return(result )
+}
+ 
+
+#For the combined dataset
+ProtoData <- impute_with_metadata(ProtoData)
+ 
+# Check result
+dim(ProtoData)
+head(ProtoData)
+```
+
+# Overall missing value count after imputation
+```{r}
+sum(is.na(ProtoData))
+```
+#=====================================================================================
+#
+# 3. Identify and count duplicates for removal (NB: Some samples had 2 records and hence the 1st occurence of samples with this case #were selected)
+#=====================================================================================
+```{r}
+# 
+total_duplicates_ProtoData <- sum(duplicated(ProtoData[,1],fromLast =FALSE))
+ProtoData <-ProtoData[!duplicated(ProtoData[,1]),]
+
+total_duplicates_pheno <- sum(duplicated(PhenoInfo[,1],fromLast =FALSE))
+PhenoInfo <-PhenoInfo[!duplicated(PhenoInfo[,3]),]
+
+total_duplicates_ProtoData
+total_duplicates_pheno
+ProtoData
+PhenoInfo
+
+```
+
+
+```{r}
+rownames(PhenoInfo) <- PhenoInfo$ID
+PhenoInfo$ID <- NULL
+
+rownames(ProtoData) <- ProtoData$ID
+ProtoData$ID <- NULL
+
+ProtoData
+PhenoInfo
+```
+
+
+
+```{r}
+# are the rownames in PhenoInfo matching ProtoData in the same order?
+all(rownames(PhenoInfo) %in% rownames(ProtoData))
+
+# are they in the same order?
+all(rownames(PhenoInfo) == rownames(ProtoData))
+```
+```{r}
+colnames(PhenoInfo)
+```
+
+```{r}
+library(dplyr)
+
+#New filter
+PhenoInfo_filtered <- PhenoInfo %>% dplyr::select(1,3,13,21:27,67,28:37,4,40,41:45,50,51,53,54,66,67,68,69,70:72)
+colnames(PhenoInfo_filtered)
+
+#save the transformed imputed protein expression matrix to new dataframe
+ProtoData_filtered <- ProtoData
+
+PhenoInfo_filtered
+ProtoData_filtered
+```
+```{r}
+colnames(PhenoInfo_filtered)
+```
+
+#=====================================================================================
+#                                                 Focus traits/variables of interest
+#
+# Sex; (2)
+# Age_at_draw; (3)
+######## Vascular:
+# PC1; (36)
+# PC2; (37)
+# PC3; (38)
+#
+# SBP,(10) 
+# DM2, (15)
+# HTNscore,(35) 
+# bmi,(18)
+# fsrp,(20) 
+# d_cmb,(21) 
+# lacunar_stroke,(25) 
+# stroke;(26) 
+# CAA: caa,(24)
+# caa_diag (23)
+# probcaa (new variable - 0/1) where probable=1, no or possible = 0; (NEW)
+#
+
+######## AD: 
+# E4 (allele number: 0, 1, 2);(28) 
+# E4status where 0 is E4=0, 1 is E4>0; (30) 
+# closest_cdr: 0 = 0, >-0.5 = 1; (31)
+# cdr_sob;(32) 
+# AD_status;(33) 
+# cog_status (based on sumbox >2.5 (34)
+
+########
+#=====================================================================================
+```{r}
+library(dplyr)
+
+#New filter
+PhenoInfo_filtered_updated <- PhenoInfo_filtered %>% dplyr::select(1,2,3,36,37,38,10,15,35,18,20,21,25,26,23,24,28,31,32,33,34)
+colnames(PhenoInfo_filtered_updated)
+
+PhenoInfo_filtered_updated
+```
+
+
+#binarize Age
+```{r}
+PhenoInfo_filtered_updated$Sex <- ifelse(PhenoInfo_filtered_updated$Sex =="Male",1,0)
+PhenoInfo_filtered_updated
+```
+
+#binarize Cohort
+```{r}
+PhenoInfo_filtered_updated$Cohort <- ifelse(PhenoInfo_filtered_updated$Cohort =="ADNI",1,0)
+
+#change the column name from Cohort to Cohort_bin
+colnames(PhenoInfo_filtered_updated)[colnames(PhenoInfo_filtered_updated)=="Cohort"]<-"Cohort_bin"
+
+PhenoInfo_filtered_updated
+```
+
+
+#binarize caa_diag
+```{r}
+PhenoInfo_filtered_updated$caa_diag <- ifelse(PhenoInfo_filtered_updated$caa_diag =="probable",1,0)
+
+#change the column name from caa_diag to cia_prob
+colnames(PhenoInfo_filtered_updated)[colnames(PhenoInfo_filtered_updated)=="caa_diag"]<-"caa_prob"
+
+PhenoInfo_filtered_updated
+```
+
+#binarize closest cdr 0 = 0 and > 0= 1
+```{r}
+PhenoInfo_filtered_updated$closest_cdr <- ifelse(PhenoInfo_filtered_updated$closest_cdr =="0",0,1)
+PhenoInfo_filtered_updated
+```
+
+#binarizelacunar stroke 0=0 (no) and > 0=1(yes) 
+```{r}
+PhenoInfo_filtered_updated$lacunar_stroke <- ifelse(PhenoInfo_filtered_updated$lacunar_stroke =="0",0,1)
+PhenoInfo_filtered_updated
+```
+#binarize E4status 
+## E4 (allele number: 0, 1, 2);(28) 
+# E4status where 0 is E4=0, 1 is E4>0; (30) 
+```{r}
+PhenoInfo_filtered_updated$E4 <- ifelse(PhenoInfo_filtered_updated$E4 =="0",0,1)
+
+#change the column name from caa_diag to cia_prob
+colnames(PhenoInfo_filtered_updated)[colnames(PhenoInfo_filtered_updated)=="E4"]<-"E4status"
+
+PhenoInfo_filtered_updated
+```
+
+
+#=====================================================================================
+#
+# 4. check the Distinct Levels of PhenoData
+#=====================================================================================
+```{r}
+DistinctLevels <- data.frame(
+  Column = names(PhenoInfo_filtered_updated ),
+  Levels = sapply(PhenoInfo_filtered_updated , function(x) paste(unique(x), collapse = ", "))
+)
+
+DistinctLevels
+```
+
+
+#=====================================================================================
+#           Rename phenodata
+# 
+#=====================================================================================
+```{r}
+# Make a copy so original remains intact
+PhenoInfo_numeric <- PhenoInfo_filtered_updated
+print(head(PhenoInfo_numeric))
+```
+
+```{r}
+library(openxlsx)
+ 
+# Restore original ID and Cohort before saving
+PhenoInfo_numeric$Cohort <- PhenoInfo_filtered$Cohort
+PhenoInfo_numeric 
+```
+
+
+#save the imputed protein expression matrix and cleaned/reorganized and filtered phenotype data
+```{r}
+# For multiple objects: 
+save(ProtoData, PhenoInfo_numeric , file = file.path(paths$results_dir, "00_output.RData"))
+
+# Save output
+
+write.xlsx(PhenoInfo_numeric, file.path(paths$results_dir, "PhenoInfo_numeric.xlsx"), rowNames = TRUE)
+write.xlsx(ProtoData_filtered, file.path(paths$results_dir, "ProtoData_filtered.xlsx"), rowNames = TRUE)
+
+```
