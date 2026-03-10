@@ -6,7 +6,8 @@
 # -------------------------------------------------
 
 suppressPackageStartupMessages({
-  library(shiny)
+  l;ibrary(shiny)
+  ""
   library(shinyjs)
 })
 
