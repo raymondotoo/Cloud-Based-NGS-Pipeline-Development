@@ -324,190 +324,789 @@ run_ml_analysis <- function(MEs, traits, target_col, split_ratio, alpha) {
   ))
 }
 
+# --- Shared helpers for Functional Analysis ---
+
+compute_datkme <- function(expr, MEs) {
+  datKME <- as.data.frame(stats::cor(expr, MEs, use = "pairwise.complete.obs"))
+  colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
+  rownames(datKME) <- colnames(expr)
+  datKME
+}
+
+build_feature_map <- function(expr, analyte_info_input) {
+  analyte_info <- resolve_analyte_info(analyte_info_input)
+
+  feature_key <- analyte_info %>%
+    dplyr::filter(Analytes %in% colnames(expr)) %>%
+    dplyr::select(Analytes, EntrezGeneSymbol) %>%
+    dplyr::filter(!is.na(EntrezGeneSymbol), EntrezGeneSymbol != "") %>%
+    dplyr::distinct() %>%
+    dplyr::rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+
+  symbol_map <- clusterProfiler::bitr(
+    feature_key$SYMBOL,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db
+  ) %>%
+    dplyr::distinct(SYMBOL, .keep_all = TRUE)
+
+  dplyr::inner_join(feature_key, symbol_map, by = "SYMBOL")
+}
+
+clean_pathway_label <- function(x, width = 42) {
+  stringr::str_wrap(
+    gsub("_", " ", gsub("^(GO_BP_|HALLMARK_|REACTOME_)", "", x)),
+    width = width
+  )
+}
+
+empty_plot <- function(title, subtitle = NULL) {
+  ggplot2::ggplot() +
+    ggplot2::theme_void() +
+    ggplot2::labs(title = title, subtitle = subtitle)
+}
+
 # --- Helper for GSEA (aligned to 07a_Functional_Analysis_GSEA.Rmd) ---
 
 run_gsea_analysis <- function(wgcna_objects, analyte_info_path, target_module, min_size, max_size) {
-    # Unpack objects
-    expr <- wgcna_objects[["expr"]]
-    MEs <- wgcna_objects[["MEs"]]
-    moduleColors <- wgcna_objects[["moduleColors"]]
-    if(is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
+  expr <- wgcna_objects[["expr"]]
+  MEs <- wgcna_objects[["MEs"]]
+  moduleColors <- wgcna_objects[["moduleColors"]]
+  if (is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
 
-    # Compute kME (module membership)
-    datKME <- as.data.frame(cor(expr, MEs, use = "p"))
-    colnames(datKME) <- paste0("kME_", sub("^ME", "", colnames(MEs)))
-    rownames(datKME) <- colnames(expr)
+  datKME <- compute_datkme(expr, MEs)
+  feature_map <- build_feature_map(expr, analyte_info_path)
+  kme_col <- paste0("kME_", target_module)
+  if (!kme_col %in% colnames(datKME)) {
+    stop("Selected module is not available in the kME matrix.")
+  }
 
-    # Annotation Mapping (SOMAmer -> Entrez)
-    analyte_info <- resolve_analyte_info(analyte_info_path)
-    
-    feature_key <- analyte_info %>%
-      dplyr::filter(Analytes %in% colnames(expr)) %>%
-      dplyr::select(Analytes, EntrezGeneSymbol) %>%
-      dplyr::distinct() %>%
-      dplyr::rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+  hm <- msigdbr::msigdbr(species = "Homo sapiens", category = "H")
+  react <- msigdbr::msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+  go <- msigdbr::msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
 
-    symbol_map <- clusterProfiler::bitr(
-      feature_key$SYMBOL,
-      fromType = "SYMBOL",
-      toType = "ENTREZID",
-      OrgDb = org.Hs.eg.db
-    ) %>% dplyr::distinct(SYMBOL, .keep_all = TRUE)
+  gene_sets <- list(
+    Hallmark = split(hm$entrez_gene, as.character(hm$gs_name)),
+    Reactome = split(react$entrez_gene, as.character(react$gs_name)),
+    GO_BP = split(go$entrez_gene, as.character(go$gs_name))
+  )
 
-    feature_map <- dplyr::inner_join(feature_key, symbol_map, by = "SYMBOL")
+  module_genes <- names(moduleColors[moduleColors == target_module])
+  ranks_df <- data.frame(
+    SOMAmer = rownames(datKME),
+    kME = datKME[[kme_col]],
+    stringsAsFactors = FALSE
+  ) %>%
+    dplyr::filter(SOMAmer %in% module_genes) %>%
+    dplyr::inner_join(feature_map, by = "SOMAmer") %>%
+    dplyr::filter(is.finite(kME), !is.na(ENTREZID)) %>%
+    dplyr::distinct(ENTREZID, .keep_all = TRUE)
 
-    # Load Gene Sets
-    hm <- msigdbr::msigdbr(species = "Homo sapiens", category = "H")
-    react <- msigdbr::msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
-    go <- msigdbr::msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+  if (nrow(ranks_df) < 15) {
+    stop("Too few mapped genes in the selected module to run GSEA.")
+  }
 
-    gene_sets <- list(
-      Hallmark = split(hm$entrez_gene, as.character(hm$gs_name)),
-      Reactome = split(react$entrez_gene, as.character(react$gs_name)),
-      GO_BP = split(go$entrez_gene, as.character(go$gs_name))
+  gene_ranks <- setNames(ranks_df$kME, ranks_df$ENTREZID)
+  gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+
+  run_fgsea_for_db <- function(pathway_sets, source_name) {
+    res <- fgsea::fgseaMultilevel(
+      pathways = pathway_sets,
+      stats = gene_ranks,
+      minSize = min_size,
+      maxSize = max_size,
+      scoreType = "pos",
+      nproc = 1
     )
 
-    # GSEA Function to run for a specific database
-    run_fgsea_for_db <- function(pathway_sets) {
-        kme_col <- paste0("kME_", target_module)
-        if (!kme_col %in% colnames(datKME)) return(NULL)
+    tibble::as_tibble(res) %>%
+      dplyr::mutate(
+        Source = source_name,
+        pathway_clean = clean_pathway_label(pathway)
+      ) %>%
+      dplyr::arrange(padj)
+  }
 
-        ranks_df <- data.frame(
-            SOMAmer = rownames(datKME),
-            kME = datKME[[kme_col]]
-        ) %>%
-        dplyr::inner_join(feature_map, by = "SOMAmer") %>%
-        dplyr::filter(is.finite(kME)) %>%
-        dplyr::distinct(ENTREZID, .keep_all = TRUE)
+  results_by_source <- list(
+    Hallmark = run_fgsea_for_db(gene_sets$Hallmark, "Hallmark"),
+    Reactome = run_fgsea_for_db(gene_sets$Reactome, "Reactome"),
+    GO_BP = run_fgsea_for_db(gene_sets$GO_BP, "GO_BP")
+  )
 
-        if (nrow(ranks_df) < 15) return(NULL)
+  combined_results <- dplyr::bind_rows(results_by_source)
 
-        gene_ranks <- setNames(ranks_df$kME, ranks_df$ENTREZID)
-        gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+  list(
+    module = target_module,
+    combined = combined_results,
+    results_by_source = results_by_source,
+    feature_map = feature_map,
+    datKME = datKME,
+    gene_ranks = gene_ranks,
+    gene_sets = gene_sets,
+    ranks_df = ranks_df
+  )
+}
 
-        fgsea::fgseaMultilevel(
-            pathways = pathway_sets,
-            stats = gene_ranks,
-            minSize = min_size,
-            maxSize = max_size,
-            nproc = 1
-        )
-    }
+get_sig_gsea_results <- function(gsea_bundle, padj_cutoff = 0.05, source_name = NULL) {
+  if (is.null(gsea_bundle) || is.null(gsea_bundle$combined)) {
+    return(tibble::tibble())
+  }
 
-    # Run GSEA for each database
-    h_res <- run_fgsea_for_db(gene_sets$Hallmark)
-    r_res <- run_fgsea_for_db(gene_sets$Reactome)
-    g_res <- run_fgsea_for_db(gene_sets$GO_BP)
+  res <- gsea_bundle$combined %>%
+    dplyr::filter(!is.na(padj), padj <= padj_cutoff)
 
-    # Combine and return results
-    combined_results <- dplyr::bind_rows(
-        if (!is.null(h_res)) tibble::as_tibble(h_res) %>% dplyr::mutate(Source = "Hallmark"),
-        if (!is.null(r_res)) tibble::as_tibble(r_res) %>% dplyr::mutate(Source = "Reactome"),
-        if (!is.null(g_res)) tibble::as_tibble(g_res) %>% dplyr::mutate(Source = "GO_BP")
+  if (!is.null(source_name) && nzchar(source_name) && source_name != "All") {
+    res <- res %>% dplyr::filter(Source == source_name)
+  }
+
+  res %>% dplyr::arrange(Source, padj)
+}
+
+plot_gsea_results <- function(gsea_bundle, padj_cutoff = 0.05, source_name = "All", top_n = 18) {
+  sig_gsea_df <- get_sig_gsea_results(gsea_bundle, padj_cutoff, source_name)
+  if (nrow(sig_gsea_df) == 0) {
+    return(empty_plot(
+      title = paste("No significant GSEA pathways for module", gsea_bundle$module),
+      subtitle = "Try a less stringent adjusted p-value cutoff."
+    ))
+  }
+
+  top_res <- sig_gsea_df %>%
+    dplyr::group_by(Source) %>%
+    dplyr::slice_max(order_by = abs(NES), n = top_n, with_ties = FALSE) %>%
+    dplyr::ungroup()
+
+  ggplot2::ggplot(
+    top_res,
+    ggplot2::aes(
+      x = NES,
+      y = reorder(pathway_clean, NES),
+      size = -log10(padj),
+      color = NES
     )
-
-    return(combined_results)
+  ) +
+    ggplot2::geom_point(alpha = 0.9) +
+    ggplot2::facet_wrap(~Source, scales = "free_y") +
+    ggplot2::scale_color_gradient2(low = "#155e75", mid = "#f8fafc", high = "#9f1239") +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.background = ggplot2::element_rect(fill = "#e2e8f0", color = NA),
+      plot.title = ggplot2::element_text(face = "bold")
+    ) +
+    ggplot2::labs(
+      title = paste("FGSEA pathway overview:", gsea_bundle$module, "module"),
+      x = "Normalized enrichment score",
+      y = NULL,
+      size = "-log10(adj. p)"
+    )
 }
 
-plot_gsea_results <- function(sig_gsea_df, module_name) {
-    if (nrow(sig_gsea_df) == 0) return(NULL)
-    
-    top_res <- sig_gsea_df %>% dplyr::slice_max(order_by = abs(NES), n = 15)
-    
-    ggplot2::ggplot(top_res, ggplot2::aes(x = NES, y = reorder(pathway, NES), size = -log10(padj), color = NES)) +
-        ggplot2::geom_point() +
-        ggplot2::scale_color_gradient2(low = "blue", mid = "white", high = "red") +
-        ggplot2::theme_bw() +
-        ggplot2::labs(title = paste("GSEA Results – Module", module_name), y = "Pathway", x = "NES")
+plot_gsea_network <- function(gsea_bundle, source_name, padj_cutoff = 0.05, n_pathways = 5) {
+  sig_res <- get_sig_gsea_results(gsea_bundle, padj_cutoff, source_name) %>%
+    dplyr::slice_max(order_by = abs(NES), n = n_pathways, with_ties = FALSE)
+
+  if (nrow(sig_res) == 0) {
+    return(empty_plot(
+      title = paste("No network plot available for", source_name),
+      subtitle = "No significant leading-edge pathways matched the current cutoff."
+    ))
+  }
+
+  id_to_symbol <- gsea_bundle$feature_map$SYMBOL
+  names(id_to_symbol) <- gsea_bundle$feature_map$ENTREZID
+
+  gene_list_symbols <- lapply(sig_res$leadingEdge, function(x) {
+    symbols <- unname(id_to_symbol[as.character(x)])
+    unique(symbols[!is.na(symbols)])
+  })
+  names(gene_list_symbols) <- clean_pathway_label(sig_res$pathway, width = 20)
+
+  enrichplot::cnetplot(
+    gene_list_symbols,
+    showCategory = min(n_pathways, length(gene_list_symbols)),
+    layout = "circle",
+    cex_label_gene = 0.7,
+    cex_label_category = 0.9,
+    colorEdge = TRUE,
+    color_edge = "category",
+    shadowtext = "gene"
+  ) +
+    ggplot2::labs(
+      title = paste("Leading-edge network:", gsea_bundle$module, "module"),
+      subtitle = source_name
+    ) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5),
+      plot.margin = ggplot2::margin(20, 20, 20, 20)
+    )
 }
 
+plot_gsea_enrichment_curve <- function(gsea_bundle, source_name, pathway_name = NULL, padj_cutoff = 0.05) {
+  sig_res <- get_sig_gsea_results(gsea_bundle, padj_cutoff, source_name)
+  if (nrow(sig_res) == 0) {
+    return(empty_plot(
+      title = paste("No enrichment curve available for", source_name),
+      subtitle = "No significant pathways matched the current cutoff."
+    ))
+  }
+
+  if (is.null(pathway_name) || !pathway_name %in% sig_res$pathway) {
+    pathway_name <- sig_res$pathway[[1]]
+  }
+
+  current_sets <- gsea_bundle$gene_sets[[source_name]]
+  pathway_stats <- sig_res %>% dplyr::filter(pathway == pathway_name) %>% dplyr::slice(1)
+
+  fgsea::plotEnrichment(current_sets[[pathway_name]], gsea_bundle$gene_ranks) +
+    ggplot2::labs(
+      title = paste("Enrichment curve:", gsea_bundle$module, "module"),
+      subtitle = clean_pathway_label(pathway_name, width = 60),
+      caption = paste0(
+        "NES = ", round(pathway_stats$NES, 2),
+        " | padj = ", format.pval(pathway_stats$padj, digits = 3)
+      )
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5),
+      plot.caption = ggplot2::element_text(hjust = 0.5, color = "#7f1d1d")
+    )
+}
 
 # --- Helper for ORA (aligned to 07b_Funtional_Analysis_ORA.Rmd) ---
 
 run_ora_analysis <- function(wgcna_objects, analyte_info_path, target_module) {
-    # Unpack objects
-    expr <- wgcna_objects[["expr"]]
-    moduleColors <- wgcna_objects[["moduleColors"]]
-    if(is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
+  expr <- wgcna_objects[["expr"]]
+  MEs <- wgcna_objects[["MEs"]]
+  moduleColors <- wgcna_objects[["moduleColors"]]
+  if (is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
 
-    # --- ID Mapping (similar to GSEA helper) ---
-    analyte_info <- resolve_analyte_info(analyte_info_path)
-    
-    feature_key <- analyte_info %>%
-      dplyr::filter(Analytes %in% colnames(expr)) %>%
-      dplyr::select(Analytes, EntrezGeneSymbol) %>%
-      dplyr::distinct() %>%
-      dplyr::rename(SOMAmer = Analytes, SYMBOL = EntrezGeneSymbol)
+  feature_map <- build_feature_map(expr, analyte_info_path)
+  universe_entrez <- unique(feature_map$ENTREZID)
 
-    symbol_map <- clusterProfiler::bitr(
-      feature_key$SYMBOL,
-      fromType = "SYMBOL",
-      toType = "ENTREZID",
-      OrgDb = org.Hs.eg.db
-    ) %>% dplyr::distinct(SYMBOL, .keep_all = TRUE)
+  module_somamers <- colnames(expr)[moduleColors == target_module]
+  module_entrez <- feature_map %>%
+    dplyr::filter(SOMAmer %in% module_somamers) %>%
+    dplyr::pull(ENTREZID) %>%
+    unique()
 
-    feature_map <- dplyr::inner_join(feature_key, symbol_map, by = "SYMBOL")
-    
-    # --- Get Gene Lists ---
-    universe_entrez <- unique(feature_map$ENTREZID)
-    
-    module_somamers <- colnames(expr)[moduleColors == target_module]
-    module_entrez <- feature_map %>%
-        dplyr::filter(SOMAmer %in% module_somamers) %>%
-        dplyr::pull(ENTREZID) %>%
-        unique()
-        
-    if (length(module_entrez) < 10) {
-        stop("Not enough mapped genes in module to run ORA (less than 10).")
+  if (length(module_entrez) < 10) {
+    stop("Not enough mapped genes in module to run ORA (less than 10).")
+  }
+
+  datKME <- compute_datkme(expr, MEs)
+
+  go_res <- clusterProfiler::enrichGO(
+    gene = module_entrez,
+    universe = universe_entrez,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 1,
+    readable = TRUE
+  )
+
+  kegg_res <- clusterProfiler::enrichKEGG(
+    gene = module_entrez,
+    universe = universe_entrez,
+    organism = "hsa",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 1
+  )
+
+  reactome_res <- ReactomePA::enrichPathway(
+    gene = module_entrez,
+    universe = universe_entrez,
+    organism = "human",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 1,
+    readable = TRUE
+  )
+
+  safe_as_tibble <- function(res, source_name) {
+    if (is.null(res) || nrow(as.data.frame(res)) == 0) {
+      return(NULL)
     }
 
-    # --- Run ORA for each database (qvalueCutoff=1 to get all results before filtering in app) ---
-    go_res <- clusterProfiler::enrichGO(
-        gene = module_entrez, universe = universe_entrez, OrgDb = org.Hs.eg.db,
-        keyType = "ENTREZID", ont = "BP", pAdjustMethod = "BH", qvalueCutoff = 1, readable = TRUE
-    )
-    
-    kegg_res <- clusterProfiler::enrichKEGG(
-        gene = module_entrez, universe = universe_entrez, organism = "hsa",
-        pAdjustMethod = "BH", qvalueCutoff = 1
-    )
-    
-    reactome_res <- ReactomePA::enrichPathway(
-        gene = module_entrez, universe = universe_entrez, organism = "human",
-        pAdjustMethod = "BH", qvalueCutoff = 1, readable = TRUE
-    )
-    
-    # --- Combine Results ---
-    safe_as_tibble <- function(res, source_name) {
-        if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
-            tibble::as_tibble(res) %>% dplyr::mutate(Source = source_name)
-        } else { NULL }
-    }
-    
-    combined <- dplyr::bind_rows(
-        safe_as_tibble(go_res, "GO_BP"),
-        safe_as_tibble(kegg_res, "KEGG"),
-        safe_as_tibble(reactome_res, "Reactome")
-    )
-    
-    return(combined)
+    tibble::as_tibble(res) %>%
+      dplyr::mutate(
+        Source = source_name,
+        pathway_clean = stringr::str_wrap(Description, width = 50)
+      )
+  }
+
+  combined <- dplyr::bind_rows(
+    safe_as_tibble(go_res, "GO_BP"),
+    safe_as_tibble(kegg_res, "KEGG"),
+    safe_as_tibble(reactome_res, "Reactome")
+  )
+
+  list(
+    module = target_module,
+    combined = combined,
+    enrich_objects = list(GO_BP = go_res, KEGG = kegg_res, Reactome = reactome_res),
+    feature_map = feature_map,
+    datKME = datKME,
+    module_somamers = module_somamers
+  )
 }
 
-plot_ora_results <- function(sig_ora_df, module_name) {
-    if (is.null(sig_ora_df) || nrow(sig_ora_df) == 0) {
-        return(ggplot2::ggplot() + ggplot2::theme_void() + ggplot2::ggtitle(paste("No significant ORA results for module", module_name)))
-    }
-    
-    top_res <- sig_ora_df %>% dplyr::group_by(Source) %>% dplyr::slice_min(order_by = p.adjust, n = 10, with_ties = FALSE) %>% dplyr::ungroup()
-    top_res$GeneRatioNumeric <- sapply(top_res$GeneRatio, function(x) eval(parse(text=x)))
+get_sig_ora_results <- function(ora_bundle, padj_cutoff = 0.05, source_name = NULL) {
+  if (is.null(ora_bundle) || is.null(ora_bundle$combined)) {
+    return(tibble::tibble())
+  }
 
-    ggplot2::ggplot(top_res, ggplot2::aes(x = GeneRatioNumeric, y = reorder(Description, GeneRatioNumeric))) +
-        ggplot2::geom_point(ggplot2::aes(size = Count, color = p.adjust)) +
-        ggplot2::facet_wrap(~Source, scales = "free_y") +
-        ggplot2::scale_color_viridis_c(guide = ggplot2::guide_colorbar(reverse = TRUE)) +
-        ggplot2::theme_bw(base_size = 11) +
-        ggplot2::labs(title = paste("ORA Results – Module", module_name), x = "Gene Ratio", y = "Pathway / Term", color = "Adj. P-value") +
-        ggplot2::theme(axis.text.y = ggplot2::element_text(size = 9))
+  res <- ora_bundle$combined %>%
+    dplyr::filter(!is.na(p.adjust), p.adjust <= padj_cutoff)
+
+  if (!is.null(source_name) && nzchar(source_name) && source_name != "All") {
+    res <- res %>% dplyr::filter(Source == source_name)
+  }
+
+  res %>% dplyr::arrange(Source, p.adjust)
+}
+
+plot_ora_results <- function(ora_bundle, padj_cutoff = 0.05, source_name = "All", top_n = 10) {
+  sig_ora_df <- get_sig_ora_results(ora_bundle, padj_cutoff, source_name)
+  if (nrow(sig_ora_df) == 0) {
+    return(empty_plot(
+      title = paste("No significant ORA terms for module", ora_bundle$module),
+      subtitle = "Try a less stringent adjusted p-value cutoff."
+    ))
+  }
+
+  top_res <- sig_ora_df %>%
+    dplyr::group_by(Source) %>%
+    dplyr::slice_min(order_by = p.adjust, n = top_n, with_ties = FALSE) %>%
+    dplyr::ungroup()
+
+  top_res$GeneRatioNumeric <- vapply(top_res$GeneRatio, function(x) eval(parse(text = x)), numeric(1))
+
+  ggplot2::ggplot(
+    top_res,
+    ggplot2::aes(
+      x = GeneRatioNumeric,
+      y = reorder(pathway_clean, GeneRatioNumeric)
+    )
+  ) +
+    ggplot2::geom_segment(
+      ggplot2::aes(x = 0, xend = GeneRatioNumeric, yend = pathway_clean),
+      color = "#cbd5e1"
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(size = Count, color = -log10(p.adjust)),
+      alpha = 0.95
+    ) +
+    ggplot2::facet_wrap(~Source, scales = "free_y") +
+    ggplot2::scale_color_gradient(low = "#fbbf24", high = "#9f1239") +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.background = ggplot2::element_rect(fill = "#e2e8f0", color = NA),
+      plot.title = ggplot2::element_text(face = "bold")
+    ) +
+    ggplot2::labs(
+      title = paste("ORA term overview:", ora_bundle$module, "module"),
+      x = "Gene ratio",
+      y = NULL,
+      color = "-log10(adj. p)"
+    )
+}
+
+plot_ora_cnet <- function(ora_bundle, source_name, padj_cutoff = 0.05, top_n = 5) {
+  enrich_obj <- ora_bundle$enrich_objects[[source_name]]
+  if (is.null(enrich_obj) || nrow(as.data.frame(enrich_obj)) == 0) {
+    return(empty_plot(title = paste("No cnet plot available for", source_name)))
+  }
+
+  df <- as.data.frame(enrich_obj)
+  df <- df[df$p.adjust <= padj_cutoff, , drop = FALSE]
+  if (nrow(df) == 0) {
+    return(empty_plot(
+      title = paste("No cnet plot available for", source_name),
+      subtitle = "No significant enriched terms matched the current cutoff."
+    ))
+  }
+
+  enrich_obj@result <- enrich_obj@result[enrich_obj@result$p.adjust <= padj_cutoff, , drop = FALSE]
+
+  enrichplot::cnetplot(
+    enrich_obj,
+    showCategory = min(top_n, nrow(enrich_obj@result)),
+    circular = FALSE,
+    colorEdge = TRUE
+  ) +
+    ggplot2::labs(
+      title = paste("ORA concept network:", ora_bundle$module, "module"),
+      subtitle = source_name
+    ) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5)
+    )
+}
+
+extract_ora_hub_genes <- function(ora_bundle, source_name = "GO_BP", padj_cutoff = 0.05, kME_threshold = 0.7) {
+  ora_res <- ora_bundle$enrich_objects[[source_name]]
+  if (is.null(ora_res) || nrow(as.data.frame(ora_res)) == 0) {
+    return(tibble::tibble())
+  }
+
+  df <- as.data.frame(ora_res) %>%
+    dplyr::filter(p.adjust <= padj_cutoff)
+
+  if (nrow(df) == 0) {
+    return(tibble::tibble())
+  }
+
+  kme_col <- paste0("kME_", ora_bundle$module)
+  module_genes <- ora_bundle$feature_map %>%
+    dplyr::filter(SOMAmer %in% ora_bundle$module_somamers) %>%
+    dplyr::left_join(
+      data.frame(
+        SOMAmer = rownames(ora_bundle$datKME),
+        kME = ora_bundle$datKME[, kme_col],
+        stringsAsFactors = FALSE
+      ),
+      by = "SOMAmer"
+    ) %>%
+    dplyr::filter(kME >= kME_threshold)
+
+  hub_rows <- lapply(seq_len(nrow(df)), function(i) {
+    pathway_genes <- unlist(strsplit(df$geneID[i], "/"))
+    hubs <- module_genes %>%
+      dplyr::filter(SYMBOL %in% pathway_genes) %>%
+      dplyr::arrange(dplyr::desc(kME))
+
+    if (nrow(hubs) == 0) {
+      return(NULL)
+    }
+
+    hubs %>%
+      dplyr::mutate(
+        Pathway = df$Description[i],
+        Source = source_name
+      ) %>%
+      dplyr::select(Source, Pathway, SOMAmer, SYMBOL, ENTREZID, kME)
+  })
+
+  dplyr::bind_rows(hub_rows)
+}
+
+# --- Helper for Supplementary Analysis (aligned to 08_Supplementary_analysis_v3.Rmd) ---
+
+infer_cohort_labels <- function(sample_ids, traits = NULL) {
+  if (!is.null(traits) && "Cohort" %in% colnames(traits)) {
+    cohort <- as.character(traits$Cohort)
+    names(cohort) <- rownames(traits)
+    cohort <- cohort[sample_ids]
+    cohort[cohort %in% c("MAP", "ADRC")] <- "ADRC"
+    return(cohort)
+  }
+
+  ifelse(
+    grepl("^ADNI", sample_ids), "ADNI",
+    ifelse(grepl("^MAP|^ADRC", sample_ids), "ADRC", NA_character_)
+  )
+}
+
+run_supplementary_analysis <- function(wgcna_objects, selected_modules = NULL, n_permutations = 100) {
+  expr <- wgcna_objects[["expr"]]
+  MEs <- wgcna_objects[["MEs"]]
+  moduleColors <- wgcna_objects[["moduleColors"]]
+  traits <- wgcna_objects[["traits"]]
+  if (is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
+
+  if (is.null(selected_modules) || length(selected_modules) == 0) {
+    selected_modules <- intersect(c("red", "lightyellow", "black", "magenta"), unique(moduleColors))
+  }
+  selected_modules <- unique(selected_modules)
+
+  datKME <- WGCNA::signedKME(expr, MEs)
+  final_protein_kME <- data.frame(
+    ProteinID = colnames(expr),
+    ModuleColor = moduleColors,
+    datKME,
+    check.names = FALSE
+  )
+
+  sample_ids <- rownames(expr)
+  cohort <- infer_cohort_labels(sample_ids, traits)
+  valid_cohort <- !is.na(cohort)
+  preservation_summary <- NULL
+  preservation_raw <- NULL
+
+  if (sum(cohort == "ADNI", na.rm = TRUE) > 10 && sum(cohort == "ADRC", na.rm = TRUE) > 10) {
+    multiExpr <- list(
+      ADNI = list(data = expr[cohort == "ADNI" & valid_cohort, , drop = FALSE]),
+      ADRC = list(data = expr[cohort == "ADRC" & valid_cohort, , drop = FALSE])
+    )
+    multiColor <- list(
+      ADNI = as.character(moduleColors),
+      ADRC = as.character(moduleColors)
+    )
+
+    pres <- WGCNA::modulePreservation(
+      multiExpr,
+      multiColor = multiColor,
+      referenceNetworks = 1,
+      nPermutations = n_permutations,
+      networkType = "signed",
+      randomSeed = 123,
+      verbose = 0
+    )
+
+    adrc_slot <- grep("ADRC", names(pres$preservation$Z$ref.ADNI), value = TRUE)[1]
+    if (!is.na(adrc_slot) && length(selected_modules) > 0) {
+      z_stats <- pres$preservation$Z$ref.ADNI[[adrc_slot]][selected_modules, , drop = FALSE]
+      obs_stats <- pres$preservation$observed$ref.ADNI[[adrc_slot]][selected_modules, , drop = FALSE]
+      preservation_summary <- data.frame(
+        Module = rownames(z_stats),
+        Size = z_stats$moduleSize,
+        Z_ADRC = z_stats$Zsummary.pres,
+        medianRank_ADRC = obs_stats$medianRank.pres,
+        stringsAsFactors = FALSE
+      ) %>%
+        dplyr::mutate(
+          Preservation_Status = dplyr::case_when(
+            Z_ADRC > 10 ~ "Strongly Preserved",
+            Z_ADRC > 2 ~ "Moderately Preserved",
+            TRUE ~ "Weak/No Preservation"
+          )
+        ) %>%
+        dplyr::arrange(medianRank_ADRC)
+
+      preservation_raw <- pres
+    }
+  }
+
+  analysis_map <- list(
+    list(m = "MEred", t = "fsrp"),
+    list(m = "MEred", t = "htnscore"),
+    list(m = "MElightyellow", t = "PC1"),
+    list(m = "MEblack", t = "caa"),
+    list(m = "MEmagenta", t = "bmi")
+  )
+
+  run_adjusted_model <- function(module_name, trait_name) {
+    req_cols <- c(module_name, trait_name, "Age_at_draw", "Sex", "AD_status")
+    if (!all(req_cols %in% c(colnames(MEs), colnames(traits)))) {
+      return(NULL)
+    }
+
+    df_reg <- data.frame(
+      ME = MEs[[module_name]],
+      Trait = traits[[trait_name]],
+      Age = traits$Age_at_draw,
+      Sex = traits$Sex,
+      AD = traits$AD_status
+    ) %>%
+      stats::na.omit()
+
+    if (nrow(df_reg) < 10) {
+      return(NULL)
+    }
+
+    fit <- stats::lm(ME ~ Trait + Age + Sex + AD, data = df_reg)
+    res <- coef(summary(fit))["Trait", ]
+    data.frame(
+      Module = module_name,
+      Trait = trait_name,
+      Beta = res[1],
+      SE = res[2],
+      P = res[4],
+      stringsAsFactors = FALSE
+    )
+  }
+
+  adj_results <- dplyr::bind_rows(lapply(analysis_map, function(x) run_adjusted_model(x$m, x$t)))
+  comparison_table <- NULL
+  if (nrow(adj_results) > 0) {
+    comparison_table <- adj_results %>%
+      dplyr::mutate(
+        Original_Cor = vapply(
+          seq_len(n()),
+          function(i) stats::cor(MEs[[Module[i]]], traits[[Trait[i]]], use = "pairwise.complete.obs"),
+          numeric(1)
+        )
+      )
+  }
+
+  top_hubs <- final_protein_kME %>%
+    dplyr::filter(ModuleColor %in% selected_modules) %>%
+    tidyr::pivot_longer(
+      cols = dplyr::starts_with("kME"),
+      names_to = "kME_Type",
+      values_to = "kME_Value"
+    ) %>%
+    dplyr::filter(gsub("^kME", "", kME_Type) == ModuleColor) %>%
+    dplyr::group_by(ModuleColor) %>%
+    dplyr::slice_max(order_by = kME_Value, n = 10, with_ties = FALSE) %>%
+    dplyr::ungroup()
+
+  key_cor <- list(ADNI = NULL, ADRC = NULL)
+  key_p <- list(ADNI = NULL, ADRC = NULL)
+
+  if (!is.null(traits) && sum(cohort == "ADNI", na.rm = TRUE) > 5 && sum(cohort == "ADRC", na.rm = TRUE) > 5) {
+    numeric_traits <- traits %>% dplyr::select(where(is.numeric))
+    common_modules <- intersect(paste0("ME", selected_modules), colnames(MEs))
+    if (ncol(numeric_traits) > 0 && length(common_modules) > 0) {
+      cor_adni <- WGCNA::cor(
+        MEs[cohort == "ADNI" & !is.na(cohort), common_modules, drop = FALSE],
+        numeric_traits[cohort == "ADNI" & !is.na(cohort), , drop = FALSE],
+        use = "pairwise.complete.obs"
+      )
+      p_adni <- WGCNA::corPvalueStudent(cor_adni, sum(cohort == "ADNI", na.rm = TRUE))
+
+      cor_adrc <- WGCNA::cor(
+        MEs[cohort == "ADRC" & !is.na(cohort), common_modules, drop = FALSE],
+        numeric_traits[cohort == "ADRC" & !is.na(cohort), , drop = FALSE],
+        use = "pairwise.complete.obs"
+      )
+      p_adrc <- WGCNA::corPvalueStudent(cor_adrc, sum(cohort == "ADRC", na.rm = TRUE))
+
+      key_cor <- list(ADNI = cor_adni, ADRC = cor_adrc)
+      key_p <- list(ADNI = p_adni, ADRC = p_adrc)
+    }
+  }
+
+  list(
+    selected_modules = selected_modules,
+    preservation_summary = preservation_summary,
+    preservation_raw = preservation_raw,
+    adjusted_results = adj_results,
+    comparison_table = comparison_table,
+    protein_kme = final_protein_kME,
+    top_hubs = top_hubs,
+    cohort_cor = key_cor,
+    cohort_p = key_p
+  )
+}
+
+plot_supp_preservation <- function(supp_bundle) {
+  df <- supp_bundle$preservation_summary
+  if (is.null(df) || nrow(df) == 0) {
+    return(empty_plot(
+      title = "Module preservation unavailable",
+      subtitle = "Both ADNI and ADRC cohorts with sufficient samples are required."
+    ))
+  }
+
+  plot_data <- df %>%
+    dplyr::mutate(is_key = ifelse(Module %in% supp_bundle$selected_modules, "Key", "Other"))
+
+  ggplot2::ggplot(plot_data, ggplot2::aes(x = Size, y = Z_ADRC)) +
+    ggplot2::geom_hline(yintercept = 2, linetype = "dashed", color = "#0f766e") +
+    ggplot2::geom_hline(yintercept = 10, linetype = "dashed", color = "#9f1239") +
+    ggplot2::geom_point(ggplot2::aes(color = is_key), size = 3) +
+    ggrepel::geom_text_repel(ggplot2::aes(label = Module), size = 3.5, max.overlaps = 15) +
+    ggplot2::scale_color_manual(values = c(Key = "#9f1239", Other = "#475569")) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::labs(
+      title = "Module preservation: ADNI to ADRC",
+      subtitle = "Zsummary versus module size",
+      x = "Module size",
+      y = "Zsummary preservation score",
+      color = NULL
+    )
+}
+
+plot_supp_forest <- function(supp_bundle) {
+  df <- supp_bundle$comparison_table
+  if (is.null(df) || nrow(df) == 0) {
+    return(empty_plot(
+      title = "Sensitivity analysis unavailable",
+      subtitle = "Required traits for the adjusted regression models were not all present."
+    ))
+  }
+
+  forest_data <- df %>%
+    dplyr::select(Module, Trait, Unadj_Beta = Original_Cor, Adj_Beta = Beta, SE) %>%
+    tidyr::pivot_longer(
+      cols = c(Unadj_Beta, Adj_Beta),
+      names_to = "Model",
+      values_to = "Estimate"
+    )
+
+  ggplot2::ggplot(
+    forest_data,
+    ggplot2::aes(x = Estimate, y = interaction(Module, Trait), color = Model)
+  ) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dotted", color = "#94a3b8") +
+    ggplot2::geom_errorbarh(
+      ggplot2::aes(xmin = Estimate - (1.96 * SE), xmax = Estimate + (1.96 * SE)),
+      position = ggplot2::position_dodge(width = 0.5),
+      height = 0.2
+    ) +
+    ggplot2::geom_point(position = ggplot2::position_dodge(width = 0.5), size = 3) +
+    ggplot2::scale_color_manual(values = c(Unadj_Beta = "#0f766e", Adj_Beta = "#9f1239")) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::labs(
+      title = "Sensitivity analysis with AD adjustment",
+      subtitle = "95% confidence intervals around adjusted effect estimates",
+      x = "Effect size",
+      y = "Module-trait pair",
+      color = NULL
+    )
+}
+
+plot_supp_top_hubs <- function(supp_bundle) {
+  df <- supp_bundle$top_hubs
+  if (is.null(df) || nrow(df) == 0) {
+    return(empty_plot(title = "Hub protein plot unavailable"))
+  }
+
+  ggplot2::ggplot(df, ggplot2::aes(x = reorder(ProteinID, kME_Value), y = kME_Value)) +
+    ggplot2::geom_segment(
+      ggplot2::aes(xend = reorder(ProteinID, kME_Value), yend = 0),
+      color = "#cbd5e1"
+    ) +
+    ggplot2::geom_point(ggplot2::aes(color = ModuleColor), size = 3.5) +
+    ggplot2::coord_flip() +
+    ggplot2::facet_wrap(~ModuleColor, scales = "free_y") +
+    ggplot2::scale_color_identity() +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(panel.grid.major.y = ggplot2::element_blank()) +
+    ggplot2::labs(
+      title = "Top hub proteins across selected modules",
+      subtitle = "Ranked by module membership (kME)",
+      x = "Protein",
+      y = "kME strength"
+    )
+}
+
+plot_supp_cohort_heatmap <- function(supp_bundle, cohort_name) {
+  cor_matrix <- supp_bundle$cohort_cor[[cohort_name]]
+  p_matrix <- supp_bundle$cohort_p[[cohort_name]]
+  if (is.null(cor_matrix) || is.null(p_matrix)) {
+    plot.new()
+    text(0.5, 0.5, paste("No cohort heatmap available for", cohort_name))
+    return(invisible(NULL))
+  }
+
+  textMatrix <- paste(signif(cor_matrix, 2), "\n(", signif(p_matrix, 1), ")", sep = "")
+  dim(textMatrix) <- dim(cor_matrix)
+  par(mar = c(10, 12, 4, 4))
+  WGCNA::labeledHeatmap(
+    Matrix = cor_matrix,
+    xLabels = colnames(cor_matrix),
+    yLabels = rownames(cor_matrix),
+    ySymbols = rownames(cor_matrix),
+    colorLabels = FALSE,
+    colors = WGCNA::blueWhiteRed(50),
+    textMatrix = textMatrix,
+    setStdMargins = FALSE,
+    cex.text = 0.6,
+    cex.lab.x = 0.8,
+    cex.lab.y = 0.8,
+    zlim = c(-1, 1),
+    main = paste(cohort_name, "module-trait relationships")
+  )
 }
 
 # --- Helper for Data Preprocessing (aligned to 00_Data_preprocessing.Rmd) ---

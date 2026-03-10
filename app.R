@@ -38,7 +38,7 @@ message("All packages loaded.")
 
 # Source the helper file containing the analysis functions
 # (Functions expected: run_module_scoring, run_ml_analysis, run_gsea_analysis, plot_gsea_results)
-if (file.exists("helpers.R")) { 
+if (file.exists("helpers.R")) {
   source("helpers.R")
 } else {
   warning("helpers.R not found in working directory. Some features may not work.")
@@ -56,6 +56,9 @@ ui <- tagList(
       .navbar { margin-bottom: 16px; }
       .well { border-radius: 8px; }
       .tab-pane { padding-top: 12px; }
+      .analysis-card { background: #f8fafc; border: 1px solid #dbe4ee; border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+      .analysis-card h4 { margin-top: 0; font-weight: 700; }
+      .section-note { color: #475569; font-size: 13px; }
       .pipeline-footer { margin: 20px 0 12px; text-align: center; font-size: 12px; color: #6b7280; }
     "))
   ),
@@ -317,9 +320,11 @@ ui <- tagList(
                           h4("GSEA Parameters"),
                           p("These parameters follow the canonical GSEA notebook `07a_Functional_Analysis_GSEA.Rmd`."),
                           selectInput("gsea_module", "Select Module to Analyze", choices = NULL),
+                          selectInput("gsea_source", "Database View", choices = c("All", "Hallmark", "Reactome", "GO_BP"), selected = "All"),
                           numericInput("gsea_minSize", "Min. Gene Set Size", value = 15, min = 5),
                           numericInput("gsea_maxSize", "Max. Gene Set Size", value = 500, min = 100),
                           sliderInput("gsea_padj_cutoff", "Significance Cutoff (padj)", value = 0.05, min = 0.01, max = 0.25),
+                          selectInput("gsea_pathway", "Pathway for Enrichment Curve", choices = NULL),
                           actionButton("run_gsea_btn", "Run GSEA", class = "btn-primary"),
                           hr(),
                           wellPanel(
@@ -332,8 +337,30 @@ ui <- tagList(
                         mainPanel(
                           div(style = "height: 800px; overflow-y: scroll; margin-top: 20px;",
                               h3("GSEA Results"),
-                              plotOutput("gsea_dotplot_output"),
-                              DT::dataTableOutput("gsea_table_output")
+                              div(class = "analysis-card",
+                                  h4("Pathway Overview"),
+                                  p(class = "section-note", "A ranked summary of significant pathway enrichments across Hallmark, Reactome, and GO biological process gene sets."),
+                                  plotOutput("gsea_dotplot_output", height = "520px")
+                              ),
+                              tabsetPanel(
+                                tabPanel("Network",
+                                         div(class = "analysis-card",
+                                             h4("Leading-Edge Network"),
+                                             p(class = "section-note", "Connections between the strongest enriched pathways and the proteins driving them."),
+                                             plotOutput("gsea_network_output", height = "620px")
+                                         )),
+                                tabPanel("Enrichment Curve",
+                                         div(class = "analysis-card",
+                                             h4("Running Score Plot"),
+                                             p(class = "section-note", "The FGSEA running enrichment curve for a selected pathway."),
+                                             plotOutput("gsea_curve_output", height = "500px")
+                                         )),
+                                tabPanel("Results Table",
+                                         div(class = "analysis-card",
+                                             h4("Detailed Results"),
+                                             DT::dataTableOutput("gsea_table_output")
+                                         ))
+                              )
                           )
                         )
                       ),
@@ -354,6 +381,7 @@ ui <- tagList(
                           h4("ORA Parameters"),
                           p("These parameters follow the canonical ORA notebook `07b_Funtional_Analysis_ORA.Rmd`."),
                           selectInput("ora_module", "Select Module to Analyze", choices = NULL),
+                          selectInput("ora_source", "Database View", choices = c("All", "GO_BP", "KEGG", "Reactome"), selected = "All"),
                           sliderInput("ora_padj_cutoff", "Significance Cutoff (padj)", value = 0.05, min = 0.01, max = 0.25),
                           actionButton("run_ora_btn", "Run ORA", class = "btn-primary"),
                           hr(),
@@ -367,8 +395,30 @@ ui <- tagList(
                         mainPanel(
                           div(style = "height: 800px; overflow-y: scroll; margin-top: 20px;",
                               h3("ORA Results"),
-                              plotOutput("ora_dotplot_output"),
-                              DT::dataTableOutput("ora_table_output")
+                              div(class = "analysis-card",
+                                  h4("Term Overview"),
+                                  p(class = "section-note", "Prioritized GO, KEGG, and Reactome terms for the selected module."),
+                                  plotOutput("ora_dotplot_output", height = "520px")
+                              ),
+                              tabsetPanel(
+                                tabPanel("Concept Network",
+                                         div(class = "analysis-card",
+                                             h4("Functional Network"),
+                                             p(class = "section-note", "A cnet-style view linking enriched terms to the genes in the module."),
+                                             plotOutput("ora_cnet_output", height = "620px")
+                                         )),
+                                tabPanel("Hub Genes",
+                                         div(class = "analysis-card",
+                                             h4("Pathway Hub Genes"),
+                                             p(class = "section-note", "Proteins with strong module membership supporting significant GO terms."),
+                                             DT::dataTableOutput("ora_hub_table_output")
+                                         )),
+                                tabPanel("Results Table",
+                                         div(class = "analysis-card",
+                                             h4("Detailed Results"),
+                                             DT::dataTableOutput("ora_table_output")
+                                         ))
+                              )
                           )
                         )
                       ),
@@ -380,7 +430,60 @@ ui <- tagList(
                               tags$li("Yu, G., et al. (2012). clusterProfiler: an R package for comparing biological themes among gene clusters. ", tags$i("OMICS: A Journal of Integrative Biology, 16"), "(5), 284-287. ", tags$a(href="https://doi.org/10.1089/omi.2011.0118", target="_blank", "DOI: 10.1089/omi.2011.0118"))
                           )
                       )
-             )
+             ),
+             tabPanel("10. Supplementary",
+                      sidebarLayout(
+                        sidebarPanel(
+                          h4("Supplementary Analyses"),
+                          p("These outputs reproduce the core elements of `08_Supplementary_analysis_v3.Rmd`."),
+                          selectInput("supp_modules", "Key Modules", choices = NULL, multiple = TRUE),
+                          numericInput("supp_permutations", "Preservation Permutations", value = 100, min = 25, step = 25),
+                          actionButton("run_supp_btn", "Run Supplementary Analysis", class = "btn-primary"),
+                          hr(),
+                          wellPanel(
+                            h4("Included Outputs"),
+                            p("Module preservation across ADNI and ADRC, AD-adjusted sensitivity models, module-membership hub proteins, and cohort-stratified module-trait heatmaps.")
+                          )
+                        ),
+                        mainPanel(
+                          div(style = "height: 850px; overflow-y: scroll; margin-top: 20px;",
+                              h3("Supplementary Results"),
+                              tabsetPanel(
+                                tabPanel("Preservation",
+                                         div(class = "analysis-card",
+                                             h4("Module Preservation"),
+                                             plotOutput("supp_preservation_plot", height = "500px"),
+                                             DT::dataTableOutput("supp_preservation_table")
+                                         )),
+                                tabPanel("Sensitivity",
+                                         div(class = "analysis-card",
+                                             h4("AD-Adjusted Sensitivity"),
+                                             plotOutput("supp_forest_plot", height = "500px"),
+                                             DT::dataTableOutput("supp_sensitivity_table")
+                                         )),
+                                tabPanel("Hub Proteins",
+                                         div(class = "analysis-card",
+                                             h4("Module Membership Hubs"),
+                                             plotOutput("supp_hub_plot", height = "560px"),
+                                             DT::dataTableOutput("supp_kme_table")
+                                         )),
+                                tabPanel("Cohort Heatmaps",
+                                         fluidRow(
+                                           column(12,
+                                                  div(class = "analysis-card",
+                                                      h4("ADNI"),
+                                                      plotOutput("supp_heatmap_adni", height = "520px")
+                                                  )),
+                                           column(12,
+                                                  div(class = "analysis-card",
+                                                      h4("ADRC"),
+                                                      plotOutput("supp_heatmap_adrc", height = "520px")
+                                                  ))
+                                         ))
+                              )
+                          )
+                        )
+                      ))
   ),
   div(class = "pipeline-footer", "ADNI-ADRC proteomics analysis app")
 )
@@ -406,7 +509,9 @@ server <- function(input, output, session) {
     pca_samples = NULL,
     wgcna_results = NULL,
     trait_cor_results = NULL,
+    gsea_results = NULL,
     ora_results = NULL,
+    supp_results = NULL,
     status = "App started. Upload phenotype, proteomics, and annotation inputs on Tab 1."
   )
   
@@ -454,6 +559,9 @@ server <- function(input, output, session) {
       pipeline_data$wgcna_results <- NULL
       pipeline_data$trait_cor_results <- NULL
       pipeline_data$sft_results <- NULL
+      pipeline_data$gsea_results <- NULL
+      pipeline_data$ora_results <- NULL
+      pipeline_data$supp_results <- NULL
       
       # Update UI choices for next steps
       batch_choices <- colnames(res$pheno)
@@ -484,9 +592,12 @@ server <- function(input, output, session) {
   
   # --- Reset Harmonization when Batch Column Changes ---
   observeEvent(input$batch_col, {
-    pipeline_data$harmonized <- NULL
-    pipeline_data$harmonized_expr <- NULL
-    pipeline_data$loaded_data <- NULL
+      pipeline_data$harmonized <- NULL
+      pipeline_data$harmonized_expr <- NULL
+      pipeline_data$loaded_data <- NULL
+      pipeline_data$gsea_results <- NULL
+      pipeline_data$ora_results <- NULL
+      pipeline_data$supp_results <- NULL
   })
 
   output$input_status_output <- renderText({
@@ -936,11 +1047,17 @@ server <- function(input, output, session) {
           moduleTraitCor = if (!is.null(pipeline_data$trait_cor_results)) pipeline_data$trait_cor_results$cor else NULL,
           moduleTraitP = if (!is.null(pipeline_data$trait_cor_results)) pipeline_data$trait_cor_results$pval else NULL
         )
+        pipeline_data$gsea_results <- NULL
+        pipeline_data$ora_results <- NULL
+        pipeline_data$supp_results <- NULL
         
         # Update GSEA module selector
         modules <- setdiff(unique(res$moduleColors), "grey")
         updateSelectInput(session, "gsea_module", choices = sort(modules), selected = modules[1])
         updateSelectInput(session, "ora_module", choices = sort(modules), selected = modules[1])
+        default_supp_modules <- intersect(c("red", "lightyellow", "black", "magenta"), modules)
+        if (length(default_supp_modules) == 0) default_supp_modules <- head(sort(modules), 4)
+        updateSelectInput(session, "supp_modules", choices = sort(modules), selected = default_supp_modules)
         pipeline_data$status <- paste(
           "Preprocessing complete.",
           "\nHarmonization complete.",
@@ -1121,24 +1238,52 @@ server <- function(input, output, session) {
     })
     
     if (is.null(gsea_results)) return()
-    
-    # Filter and render results
-    sig_gsea <- tryCatch({
-      dplyr::filter(gsea_results, padj < input$gsea_padj_cutoff)
-    }, error = function(e) {
-      showNotification("Unexpected GSEA results format.", type = "error")
-      return(NULL)
-    })
-    
-    if (!is.null(sig_gsea)) {
-      output$gsea_table_output <- DT::renderDataTable({
-        DT::datatable(sig_gsea, options = list(pageLength = 10, scrollX = TRUE))
-      })
-      
-      output$gsea_dotplot_output <- renderPlot({
-        plot_gsea_results(sig_gsea, input$gsea_module)
-      })
+    pipeline_data$gsea_results <- gsea_results
+    sig_gsea <- get_sig_gsea_results(gsea_results, input$gsea_padj_cutoff, input$gsea_source)
+    pathway_choices <- unique(sig_gsea$pathway)
+    selected_pathway <- if (length(pathway_choices) > 0) pathway_choices[[1]] else character(0)
+    updateSelectInput(session, "gsea_pathway", choices = pathway_choices, selected = selected_pathway)
+  })
+
+  observe({
+    req(pipeline_data$gsea_results)
+    sig_gsea <- get_sig_gsea_results(pipeline_data$gsea_results, input$gsea_padj_cutoff, input$gsea_source)
+    pathway_choices <- unique(sig_gsea$pathway)
+    current_choice <- isolate(input$gsea_pathway)
+    if (!length(pathway_choices)) {
+      updateSelectInput(session, "gsea_pathway", choices = character(0), selected = character(0))
+    } else {
+      selected <- if (!is.null(current_choice) && current_choice %in% pathway_choices) current_choice else pathway_choices[[1]]
+      updateSelectInput(session, "gsea_pathway", choices = pathway_choices, selected = selected)
     }
+  })
+
+  output$gsea_table_output <- DT::renderDataTable({
+    req(pipeline_data$gsea_results)
+    sig_gsea <- get_sig_gsea_results(pipeline_data$gsea_results, input$gsea_padj_cutoff, input$gsea_source)
+    DT::datatable(sig_gsea, options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$gsea_dotplot_output <- renderPlot({
+    req(pipeline_data$gsea_results)
+    plot_gsea_results(pipeline_data$gsea_results, input$gsea_padj_cutoff, input$gsea_source)
+  })
+
+  output$gsea_network_output <- renderPlot({
+    req(pipeline_data$gsea_results)
+    source_name <- if (is.null(input$gsea_source) || input$gsea_source == "All") "Hallmark" else input$gsea_source
+    plot_gsea_network(pipeline_data$gsea_results, source_name, input$gsea_padj_cutoff)
+  })
+
+  output$gsea_curve_output <- renderPlot({
+    req(pipeline_data$gsea_results)
+    source_name <- if (is.null(input$gsea_source) || input$gsea_source == "All") "Hallmark" else input$gsea_source
+    plot_gsea_enrichment_curve(
+      pipeline_data$gsea_results,
+      source_name = source_name,
+      pathway_name = input$gsea_pathway,
+      padj_cutoff = input$gsea_padj_cutoff
+    )
   })
   
   
@@ -1183,17 +1328,103 @@ server <- function(input, output, session) {
     })
     
     if (is.null(ora_results)) return()
-    
-    # Filter and render results
-    sig_ora <- dplyr::filter(ora_results, p.adjust < input$ora_padj_cutoff)
-    
-    output$ora_table_output <- DT::renderDataTable({
-      DT::datatable(sig_ora, options = list(pageLength = 10, scrollX = TRUE))
+    pipeline_data$ora_results <- ora_results
+  })
+
+  output$ora_table_output <- DT::renderDataTable({
+    req(pipeline_data$ora_results)
+    sig_ora <- get_sig_ora_results(pipeline_data$ora_results, input$ora_padj_cutoff, input$ora_source)
+    DT::datatable(sig_ora, options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$ora_dotplot_output <- renderPlot({
+    req(pipeline_data$ora_results)
+    plot_ora_results(pipeline_data$ora_results, input$ora_padj_cutoff, input$ora_source)
+  })
+
+  output$ora_cnet_output <- renderPlot({
+    req(pipeline_data$ora_results)
+    source_name <- if (is.null(input$ora_source) || input$ora_source == "All") "GO_BP" else input$ora_source
+    plot_ora_cnet(pipeline_data$ora_results, source_name, input$ora_padj_cutoff)
+  })
+
+  output$ora_hub_table_output <- DT::renderDataTable({
+    req(pipeline_data$ora_results)
+    hub_df <- extract_ora_hub_genes(
+      pipeline_data$ora_results,
+      source_name = "GO_BP",
+      padj_cutoff = input$ora_padj_cutoff
+    )
+    DT::datatable(hub_df, options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  # --- Server Logic for Tab 10: Supplementary ---
+  observeEvent(input$run_supp_btn, {
+    if (is.null(pipeline_data$loaded_data)) {
+      showNotification("Run WGCNA in this app before supplementary analysis.", type = "error")
+      return()
+    }
+
+    id <- showNotification("Running supplementary analyses...", duration = NULL, closeButton = FALSE)
+    on.exit(removeNotification(id), add = TRUE)
+
+    supp_results <- tryCatch({
+      run_supplementary_analysis(
+        wgcna_objects = pipeline_data$loaded_data,
+        selected_modules = input$supp_modules,
+        n_permutations = input$supp_permutations
+      )
+    }, error = function(e) {
+      showNotification(paste("Supplementary analysis failed:", conditionMessage(e)), type = "error")
+      return(NULL)
     })
-    
-    output$ora_dotplot_output <- renderPlot({
-      plot_ora_results(sig_ora, input$ora_module)
-    })
+
+    if (is.null(supp_results)) return()
+    pipeline_data$supp_results <- supp_results
+    showNotification("Supplementary analysis complete.", type = "message")
+  })
+
+  output$supp_preservation_plot <- renderPlot({
+    req(pipeline_data$supp_results)
+    print(plot_supp_preservation(pipeline_data$supp_results))
+  })
+
+  output$supp_preservation_table <- DT::renderDataTable({
+    req(pipeline_data$supp_results)
+    df <- pipeline_data$supp_results$preservation_summary
+    DT::datatable(if (is.null(df)) data.frame() else df, options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$supp_forest_plot <- renderPlot({
+    req(pipeline_data$supp_results)
+    print(plot_supp_forest(pipeline_data$supp_results))
+  })
+
+  output$supp_sensitivity_table <- DT::renderDataTable({
+    req(pipeline_data$supp_results)
+    df <- pipeline_data$supp_results$comparison_table
+    DT::datatable(if (is.null(df)) data.frame() else df, options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$supp_hub_plot <- renderPlot({
+    req(pipeline_data$supp_results)
+    print(plot_supp_top_hubs(pipeline_data$supp_results))
+  })
+
+  output$supp_kme_table <- DT::renderDataTable({
+    req(pipeline_data$supp_results)
+    top_kme <- pipeline_data$supp_results$protein_kme
+    DT::datatable(utils::head(top_kme, 100), options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$supp_heatmap_adni <- renderPlot({
+    req(pipeline_data$supp_results)
+    plot_supp_cohort_heatmap(pipeline_data$supp_results, "ADNI")
+  })
+
+  output$supp_heatmap_adrc <- renderPlot({
+    req(pipeline_data$supp_results)
+    plot_supp_cohort_heatmap(pipeline_data$supp_results, "ADRC")
   })
 }
 
