@@ -62,24 +62,29 @@ ui <- tagList(
   useShinyjs(),
   navbarPage(
              title = "ADNI-ADRC Proteomics Pipeline",
-             # --- Tab 1: Data Preprocessing ---
-             tabPanel("1. Preprocessing",
+             # --- Tab 1: Inputs & Preprocessing ---
+             tabPanel("1. Inputs",
                       sidebarLayout(
                         sidebarPanel(
-                          h4("Input Data"),
-                          p("Upload raw proteomics and phenotype data (Excel/CSV)."),
+                          h4("Required Inputs"),
+                          p("Upload the source files once here. Downstream steps derive PCA, ComBat, and WGCNA objects from this run."),
                           fileInput("raw_proto_file", "Proteomics Data (Expression)", accept = c(".xlsx", ".csv")),
                           fileInput("raw_pheno_file", "Phenotype Data", accept = c(".xlsx", ".csv")),
+                          fileInput("analyte_info_init", "Analyte Annotation (TSV)", accept = c(".tsv", ".txt")),
+                          fileInput("background_init", "Background Gene List (Optional CSV)", accept = c(".csv")),
                           selectInput("impute_method", "Imputation Method", choices = c("Hybrid", "KNN", "Minimum", "None"), selected = "Hybrid"),
                           actionButton("run_preprocess_btn", "Run Preprocessing", class = "btn-primary"),
                           hr(),
                           wellPanel(
                             h4("About This Step"),
-                            p("This step handles missing value imputation (using QRILC or MinProb) and filters out low-quality samples/features."),
-                            p("It ensures the expression data is numeric and aligned with the phenotype metadata.")
+                            p("This step reproduces the original workflow: ID cleanup, duplicate removal, SOMA panel filtering when available, WMH PCA derivation from phenotype, imputation of proteomics missingness, and alignment of phenotype with expression samples."),
+                            p("The canonical WMH PCA uses wmh_juxta, wmh_frontal, wmh_pv, wmh_parietal, and wmh_posterior, with PC1 sign flipped before merging into phenotype.")
                           )
                         ),
                         mainPanel(
+                          h3("Input Status"),
+                          verbatimTextOutput("input_status_output"),
+                          hr(),
                           h3("Preprocessing Diagnostics"),
                           plotOutput("missingness_plot", height = "400px"),
                           downloadButton("dl_missing_plot", "Download Plot"),
@@ -151,24 +156,18 @@ ui <- tagList(
                       )
              ),
              
-             # --- Tab 4: Setup & Load Data (WGCNA) ---
-             tabPanel("4. WGCNA Setup",
+             # --- Tab 4: Pipeline Status ---
+             tabPanel("4. Pipeline Status",
                       sidebarLayout(
                         sidebarPanel(
-                          h4("Load WGCNA Data"),
-                          p("Select the core output file from the WGCNA step (e.g., WGCNA2_core_outputs.RData)."),
-                          fileInput("wgcna_file_input", "Choose .RData File", accept = ".RData"),
-                          fileInput("pca_file_input", "Optional: Choose PCA Scores CSV", accept = ".csv"),
-                          actionButton("load_data_btn", "Load Data", class = "btn-primary"),
-                          hr(),
                           wellPanel(
                               h4("About This Step"),
-                              p("This initial step is for loading the necessary data to run the pipeline. The primary input is an `.RData` file generated from a prior WGCNA run (for example from `03_WGCNA_running.Rmd`). This file should contain essential objects like the expression matrix (`expr`), trait data (`traits`), and pre-calculated module assignments (`moduleColors`)."),
-                              p("Loading a pre-computed file saves significant time by skipping the computationally intensive network construction steps.")
+                              p("This tab reports the in-app pipeline state. No prior WGCNA or PCA output upload is required."),
+                              p("Run the tabs in order: preprocessing, harmonization, optional PCA review, WGCNA, then downstream scoring, ML, GSEA, and ORA.")
                           )
                         ),
                         mainPanel(
-                          h3("Data Loading Status"),
+                          h3("Pipeline Status"),
                           verbatimTextOutput("data_status_output")
                         )
                       )
@@ -321,14 +320,13 @@ ui <- tagList(
                           numericInput("gsea_minSize", "Min. Gene Set Size", value = 15, min = 5),
                           numericInput("gsea_maxSize", "Max. Gene Set Size", value = 500, min = 100),
                           sliderInput("gsea_padj_cutoff", "Significance Cutoff (padj)", value = 0.05, min = 0.01, max = 0.25),
-                          # Optional: allow selecting analyte info instead of hardcoded path
-                          fileInput("analyte_info_file", "Analyte Info (TSV)", accept = c(".tsv", ".txt")),
                           actionButton("run_gsea_btn", "Run GSEA", class = "btn-primary"),
                           hr(),
                           wellPanel(
                               h4("About This Step"),
                               p("Gene Set Enrichment Analysis (GSEA) is used to identify biological pathways or functions that are significantly enriched within a module. Unlike simple Over-Representation Analysis (ORA), GSEA considers the entire ranked list of proteins."),
-                              p("In this pipeline, proteins are ranked by their Module Membership (kME) value for a selected module. GSEA then determines if known biological pathways (from databases like GO, Reactome, or Hallmark) are enriched at the top of this ranked list.")
+                              p("In this pipeline, proteins are ranked by their Module Membership (kME) value for a selected module. GSEA then determines if known biological pathways (from databases like GO, Reactome, or Hallmark) are enriched at the top of this ranked list."),
+                              p("Analyte annotation comes from the upfront input tab.")
                           )
                         ),
                         mainPanel(
@@ -362,7 +360,8 @@ ui <- tagList(
                           wellPanel(
                               h4("About This Step"),
                               p("Over-Representation Analysis (ORA) determines whether known biological functions or pathways are over-represented in a given list of genes/proteins. Unlike GSEA, ORA requires a discrete list of interesting molecules (e.g., all proteins within a module) and compares it against a background universe."),
-                              p("This analysis tests for enrichment in Gene Ontology (GO), KEGG, and Reactome pathway databases.")
+                              p("This analysis tests for enrichment in Gene Ontology (GO), KEGG, and Reactome pathway databases."),
+                              p("Analyte annotation comes from the upfront input tab.")
                           )
                         ),
                         mainPanel(
@@ -397,7 +396,10 @@ server <- function(input, output, session) {
     loaded_data = NULL,
     raw_proto = NULL,
     raw_pheno = NULL,
+    analyte_info = NULL,
+    background = NULL,
     processed_data = NULL,
+    harmonized = NULL,
     sft_results = NULL,
     wgcna_filtered_data = NULL, # Store QC'd data
     pca_results = NULL,
@@ -405,7 +407,7 @@ server <- function(input, output, session) {
     wgcna_results = NULL,
     trait_cor_results = NULL,
     ora_results = NULL,
-    status = "App started. All packages loaded. Please load data."
+    status = "App started. Upload phenotype, proteomics, and annotation inputs on Tab 1."
   )
   
   # Helper to check if expected objects exist in loaded RData
@@ -434,19 +436,45 @@ server <- function(input, output, session) {
         pheno <- read.csv(input$raw_pheno_file$datapath)
       }
       
+      pipeline_data$raw_proto <- proto
+      pipeline_data$raw_pheno <- pheno
+      pipeline_data$analyte_info <- if (!is.null(input$analyte_info_init)) input$analyte_info_init$datapath else NULL
+      pipeline_data$background <- if (!is.null(input$background_init)) input$background_init$datapath else NULL
+
       # Run preprocessing
       res <- run_preprocessing(proto, pheno, input$impute_method)
       pipeline_data$processed_data <- res
+      pipeline_data$pca_results <- if (!is.null(res$wmh_pca)) res$wmh_pca$pca else NULL
+      pipeline_data$pca_samples <- if (!is.null(res$wmh_pca)) res$wmh_pca$scores$SampleID else NULL
       
       # Clear downstream results to prevent mismatch
+      pipeline_data$harmonized <- NULL
       pipeline_data$harmonized_expr <- NULL
-      pipeline_data$pca_results <- NULL
+      pipeline_data$loaded_data <- NULL
+      pipeline_data$wgcna_results <- NULL
+      pipeline_data$trait_cor_results <- NULL
+      pipeline_data$sft_results <- NULL
       
       # Update UI choices for next steps
       batch_choices <- colnames(res$pheno)
       default_batch <- if("Cohort" %in% batch_choices) "Cohort" else batch_choices[1]
       updateSelectInput(session, "batch_col", choices = batch_choices, selected = default_batch)
+
+      pheno_for_pca <- if (!is.null(res$pheno_raw)) res$pheno_raw else res$pheno
+      nums <- names(pheno_for_pca)[sapply(pheno_for_pca, is.numeric)]
+      default_pca_vars <- intersect(canonical_wmh_vars(), nums)
+      if (length(default_pca_vars) == 0) default_pca_vars <- nums[1:min(5, length(nums))]
+      updateSelectInput(session, "pca_vars", choices = nums, selected = default_pca_vars)
+      updateSelectInput(session, "pca_color_col", choices = c("None", names(pheno_for_pca)))
       
+      pipeline_data$status <- paste(
+        "Inputs loaded.",
+        "\nProteomics rows:", nrow(res$expr),
+        "\nProteomics features:", ncol(res$expr),
+        "\nPhenotype rows:", nrow(res$pheno),
+        "\nWMH PCA derived:", !is.null(res$wmh_pca),
+        "\nAnalyte annotation uploaded:", !is.null(pipeline_data$analyte_info)
+      )
       showNotification("Preprocessing complete.", type = "message")
       
     }, error = function(e) {
@@ -456,8 +484,20 @@ server <- function(input, output, session) {
   
   # --- Reset Harmonization when Batch Column Changes ---
   observeEvent(input$batch_col, {
+    pipeline_data$harmonized <- NULL
     pipeline_data$harmonized_expr <- NULL
-    pipeline_data$pca_results <- NULL
+    pipeline_data$loaded_data <- NULL
+  })
+
+  output$input_status_output <- renderText({
+    parts <- c(
+      paste("Proteomics uploaded:", !is.null(input$raw_proto_file)),
+      paste("Phenotype uploaded:", !is.null(input$raw_pheno_file)),
+      paste("Analyte annotation uploaded:", !is.null(input$analyte_info_init)),
+      paste("Background uploaded:", !is.null(input$background_init)),
+      paste("Preprocessing complete:", !is.null(pipeline_data$processed_data))
+    )
+    paste(parts, collapse = "\n")
   })
   
   output$missingness_plot <- renderPlot({
@@ -512,7 +552,14 @@ server <- function(input, output, session) {
         pheno_data = pipeline_data$processed_data$pheno,
         batch_col = input$batch_col
       )
-      pipeline_data$harmonized_expr <- harmonized
+      pipeline_data$harmonized <- harmonized
+      pipeline_data$harmonized_expr <- as.data.frame(harmonized$expr)
+      pipeline_data$status <- paste(
+        "Preprocessing complete.",
+        "\nHarmonization complete.",
+        "\nHarmonized samples:", nrow(harmonized$expr),
+        "\nHarmonized features:", ncol(harmonized$expr)
+      )
       showNotification("Harmonization (ComBat) complete.", type = "message")
     }, error = function(e) {
       showNotification(paste("Harmonization failed:", conditionMessage(e)), type = "error")
@@ -527,7 +574,7 @@ server <- function(input, output, session) {
   output$pca_after_combat <- renderPlot({
     req(pipeline_data$harmonized_expr, pipeline_data$processed_data, input$batch_col)
     # Re-construct a data frame for plotting if needed, or just pass matrix
-    plot_pca_batch(as.data.frame(pipeline_data$harmonized_expr), pipeline_data$processed_data$pheno, input$batch_col, "After ComBat")
+    plot_pca_batch(as.data.frame(pipeline_data$harmonized_expr), pipeline_data$harmonized$pheno, input$batch_col, "After ComBat")
   })
   
   output$dl_combat_plots <- downloadHandler(
@@ -536,7 +583,7 @@ server <- function(input, output, session) {
       req(pipeline_data$harmonized_expr)
       pdf(file, width = 12, height = 6)
       print(plot_pca_batch(pipeline_data$processed_data$expr, pipeline_data$processed_data$pheno, input$batch_col, "Before"))
-      print(plot_pca_batch(as.data.frame(pipeline_data$harmonized_expr), pipeline_data$processed_data$pheno, input$batch_col, "After"))
+      print(plot_pca_batch(as.data.frame(pipeline_data$harmonized_expr), pipeline_data$harmonized$pheno, input$batch_col, "After"))
       dev.off()
     }
   )
@@ -558,7 +605,7 @@ server <- function(input, output, session) {
       # Save with variable names expected by 03_WGCNA_running.Rmd
       Proto_combat_z <- as.data.frame(pipeline_data$harmonized_expr)
       # Ensure pheno matches harmonized data (in case samples were dropped/reordered)
-      pheno_combat <- pipeline_data$processed_data$pheno[rownames(Proto_combat_z), , drop=FALSE]
+      pheno_combat <- pipeline_data$harmonized$pheno[rownames(Proto_combat_z), , drop=FALSE]
       save(Proto_combat_z, pheno_combat, file = file)
     }
   )
@@ -567,7 +614,9 @@ server <- function(input, output, session) {
   
   # Helper to get current phenotype data
   current_pheno <- reactive({
-    if (!is.null(pipeline_data$processed_data$pheno)) {
+    if (!is.null(pipeline_data$processed_data$pheno_raw)) {
+      return(pipeline_data$processed_data$pheno_raw)
+    } else if (!is.null(pipeline_data$processed_data$pheno)) {
       return(pipeline_data$processed_data$pheno)
     } else if (!is.null(pipeline_data$loaded_data$traits)) {
       return(pipeline_data$loaded_data$traits)
@@ -651,84 +700,15 @@ server <- function(input, output, session) {
   
   # --- Server Logic for Tab 4: WGCNA Setup ---
   
-  observeEvent(input$load_data_btn, {
-    req(input$wgcna_file_input)
-    
-    # Create a new environment to load the RData into
-    load_env <- new.env()
-    tryCatch({
-      load(input$wgcna_file_input$datapath, envir = load_env)
-      pipeline_data$loaded_data <- as.list(load_env)
-      
-      # Handle pheno_combat -> traits alias if traits missing (common in 02_output.RData)
-      if(is.null(pipeline_data$loaded_data$traits) && !is.null(pipeline_data$loaded_data$pheno_combat)) {
-          pipeline_data$loaded_data$traits <- pipeline_data$loaded_data$pheno_combat
-      }
-      
-      # Merge PCA scores if provided
-      if (!is.null(input$pca_file_input)) {
-        pca_df <- read.csv(input$pca_file_input$datapath, stringsAsFactors = FALSE)
-        
-        # Ensure SampleID column exists
-        if(!"SampleID" %in% colnames(pca_df)) colnames(pca_df)[1] <- "SampleID"
-        
-        # Deduplicate
-        pca_df <- pca_df[!duplicated(pca_df$SampleID), ]
-        
-        if(!is.null(pipeline_data$loaded_data$traits)) {
-          traits <- pipeline_data$loaded_data$traits
-          matched <- match(rownames(traits), pca_df$SampleID)
-          
-          # Merge PC columns
-          for(col in intersect(colnames(pca_df), c("PC1", "PC2", "PC3"))) {
-            traits[[col]] <- pca_df[[col]][matched]
-          }
-          pipeline_data$loaded_data$traits <- traits
-          showNotification("Merged PCA scores into phenotype data.", type = "message")
-        }
-      }
-      
-      loaded_vars <- names(pipeline_data$loaded_data)
-      pipeline_data$status <- paste(
-        "Successfully loaded:", input$wgcna_file_input$name,
-        "\nContains objects:", paste(loaded_vars, collapse = ", ")
-      )
-      
-      # Reset results from previous runs to clear plots
-      pipeline_data$sft_results <- NULL
-      pipeline_data$wgcna_results <- NULL
-      pipeline_data$trait_cor_results <- NULL
-      
-      # Update GSEA module selector if moduleColors exist
-      if ("moduleColors" %in% loaded_vars) {
-        modules <- setdiff(unique(pipeline_data$loaded_data$moduleColors), "grey")
-        updateSelectInput(session, "gsea_module", choices = sort(modules), selected = modules[1])
-        updateSelectInput(session, "ora_module", choices = sort(modules), selected = modules[1])
-      } else {
-        updateSelectInput(session, "gsea_module", choices = character(0))
-        updateSelectInput(session, "ora_module", choices = character(0))
-      }
-      
-      # Setup WGCNA heatmap if results exist
-      if ("moduleTraitCor" %in% loaded_vars && "moduleTraitP" %in% loaded_vars) {
-        pipeline_data$trait_cor_results <- list(
-          cor = pipeline_data$loaded_data$moduleTraitCor,
-          pval = pipeline_data$loaded_data$moduleTraitP
-        )
-        all_traits <- colnames(pipeline_data$loaded_data$moduleTraitCor)
-        want_traits <- c("Sex","Age_at_draw","PC1","PC2","PC3","SBP","d_cmb","fsrp","htnscore","lacunar_stroke","dm","bmi","stroke","caa_prob","caa","AD_status","cog_status","E4status")
-        updateSelectInput(session, "wgcna_traits", choices = all_traits, selected = intersect(want_traits, all_traits))
-      }
-      
-      showNotification("Data loaded successfully!", type = "message")
-    }, error = function(e) {
-      pipeline_data$status <- paste("ERROR loading file:", conditionMessage(e))
-      showNotification(pipeline_data$status, type = "error")
-    })
-  })
-  
   output$data_status_output <- renderText({
-    pipeline_data$status
+    paste(
+      pipeline_data$status,
+      paste("Upfront analyte annotation available:", !is.null(pipeline_data$analyte_info)),
+      paste("Preprocessed data available:", !is.null(pipeline_data$processed_data)),
+      paste("Harmonized data available:", !is.null(pipeline_data$harmonized_expr)),
+      paste("WGCNA objects available:", !is.null(pipeline_data$loaded_data)),
+      sep = "\n"
+    )
   })
   
   # --- (Optional) WGCNA tab placeholders ---
@@ -853,26 +833,15 @@ server <- function(input, output, session) {
   
   # --- Server Logic for Tab 5: WGCNA ---
   observeEvent(input$run_sft_btn, {
-    # Determine input data (prefer pipeline data, fallback to loaded data)
-    expr_to_use <- if (!is.null(pipeline_data$harmonized_expr)) {
-      as.data.frame(pipeline_data$harmonized_expr)
-    } else if (!is.null(pipeline_data$loaded_data$expr)) {
-      pipeline_data$loaded_data$expr
-    } else {
-      NULL
-    }
+    expr_to_use <- if (!is.null(pipeline_data$harmonized_expr)) as.data.frame(pipeline_data$harmonized_expr) else NULL
     
     if (is.null(expr_to_use)) {
-      showNotification("No expression data found. Run Harmonization (Tab 2) or load WGCNA data (Tab 4).", type = "error")
+      showNotification("No harmonized expression data found. Run Harmonization first.", type = "error")
       return()
     }
     
     # Get traits for alignment/QC
-    traits_to_use <- if (!is.null(pipeline_data$processed_data$pheno)) {
-      pipeline_data$processed_data$pheno
-    } else {
-      pipeline_data$loaded_data$traits
-    }
+    traits_to_use <- if (!is.null(pipeline_data$harmonized$pheno)) pipeline_data$harmonized$pheno else pipeline_data$processed_data$pheno
     
     withProgress(message = 'Analyzing Soft Threshold', value = 0, {
       update_prog <- function(detail) {
@@ -901,17 +870,10 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$run_wgcna_btn, {
-    # Determine input data
-    expr_to_use <- if (!is.null(pipeline_data$harmonized_expr)) {
-      as.data.frame(pipeline_data$harmonized_expr)
-    } else if (!is.null(pipeline_data$loaded_data$expr)) {
-      pipeline_data$loaded_data$expr
-    } else {
-      NULL
-    }
+    expr_to_use <- if (!is.null(pipeline_data$harmonized_expr)) as.data.frame(pipeline_data$harmonized_expr) else NULL
     
     if (is.null(expr_to_use)) {
-      showNotification("No expression data found. Run Harmonization (Tab 2) or load WGCNA data (Tab 4).", type = "error")
+      showNotification("No harmonized expression data found. Run Harmonization first.", type = "error")
       return()
     }
     
@@ -924,11 +886,7 @@ server <- function(input, output, session) {
       
       tryCatch({
         # Get traits for alignment/QC
-        traits_to_use <- if (!is.null(pipeline_data$processed_data$pheno)) {
-          pipeline_data$processed_data$pheno
-        } else {
-          pipeline_data$loaded_data$traits
-        }
+        traits_to_use <- if (!is.null(pipeline_data$harmonized$pheno)) pipeline_data$harmonized$pheno else pipeline_data$processed_data$pheno
         
         # Run QC (or use cached if available from SFT step, but safer to re-run to ensure consistency)
         qc_res <- perform_wgcna_qc(expr_to_use, traits_to_use)
@@ -946,27 +904,6 @@ server <- function(input, output, session) {
         
         # Update pipeline data
         pipeline_data$wgcna_results <- res
-        
-        # Merge PCA results if available (e.g. from Tab 3)
-        if (!is.null(pipeline_data$pca_results) && !is.null(traits_to_use)) {
-          pca_scores <- as.data.frame(pipeline_data$pca_results$x)
-          # Keep top 5 PCs
-          pca_scores <- pca_scores[, 1:min(5, ncol(pca_scores)), drop=FALSE]
-          
-          # Match samples using merge to handle potential rowname mismatches or subsets
-          # First ensure SampleID column exists or use rownames
-          if(!"SampleID" %in% colnames(traits_to_use)) traits_to_use$SampleID <- rownames(traits_to_use)
-          pca_scores$SampleID <- rownames(pca_scores)
-          
-          # Remove existing PC cols from traits to avoid duplicates
-          pc_cols <- setdiff(colnames(pca_scores), "SampleID")
-          traits_to_use <- traits_to_use[, !colnames(traits_to_use) %in% pc_cols, drop=FALSE]
-          
-          # Merge
-          traits_to_use <- merge(traits_to_use, pca_scores, by="SampleID", all.x=TRUE)
-          rownames(traits_to_use) <- traits_to_use$SampleID
-          traits_to_use$SampleID <- NULL
-        }
         
         if (!is.null(traits_to_use)) {
           # Calculate correlations for ALL numeric traits available
@@ -989,12 +926,27 @@ server <- function(input, output, session) {
             updateSelectInput(session, "wgcna_traits", choices = all_traits, selected = selected)
           }
         }
+
+        pipeline_data$loaded_data <- list(
+          expr = expr_to_use,
+          MEs = res$MEs,
+          moduleColors = res$moduleColors,
+          geneTree = res$geneTree,
+          traits = traits_to_use,
+          moduleTraitCor = if (!is.null(pipeline_data$trait_cor_results)) pipeline_data$trait_cor_results$cor else NULL,
+          moduleTraitP = if (!is.null(pipeline_data$trait_cor_results)) pipeline_data$trait_cor_results$pval else NULL
+        )
         
         # Update GSEA module selector
         modules <- setdiff(unique(res$moduleColors), "grey")
         updateSelectInput(session, "gsea_module", choices = sort(modules), selected = modules[1])
         updateSelectInput(session, "ora_module", choices = sort(modules), selected = modules[1])
-
+        pipeline_data$status <- paste(
+          "Preprocessing complete.",
+          "\nHarmonization complete.",
+          "\nWGCNA complete.",
+          "\nModules detected:", length(unique(res$moduleColors))
+        )
         showNotification("WGCNA analysis completed successfully.", type = "message")
         
       }, error = function(e) {
@@ -1011,7 +963,7 @@ server <- function(input, output, session) {
       req(pipeline_data$wgcna_results)
       
       # Prepare objects to match the expected input for downstream steps
-      expr <- if(!is.null(pipeline_data$harmonized_expr)) as.data.frame(pipeline_data$harmonized_expr) else pipeline_data$loaded_data$expr
+      expr <- as.data.frame(pipeline_data$harmonized_expr)
       MEs <- pipeline_data$wgcna_results$MEs
       moduleColors <- pipeline_data$wgcna_results$moduleColors
       geneTree <- pipeline_data$wgcna_results$geneTree
@@ -1032,7 +984,7 @@ server <- function(input, output, session) {
   observeEvent(input$run_scoring_btn, {
     # Ensure data is loaded
     if (is.null(pipeline_data$loaded_data)) {
-      showNotification("Please load WGCNA data in Tab 4 first.", type = "error")
+      showNotification("Run WGCNA in this app before scoring modules.", type = "error")
       return()
     }
     
@@ -1074,7 +1026,7 @@ server <- function(input, output, session) {
   # --- Server Logic for Tab 7: Machine Learning ---
   observeEvent(input$run_ml_btn, {
     if (is.null(pipeline_data$loaded_data)) {
-      showNotification("Please load WGCNA data in Tab 4 first.", type = "error")
+      showNotification("Run WGCNA in this app before training the ML model.", type = "error")
       return()
     }
     
@@ -1125,7 +1077,7 @@ server <- function(input, output, session) {
   # --- Server Logic for Tab 8: GSEA ---
   observeEvent(input$run_gsea_btn, {
     if (is.null(pipeline_data$loaded_data)) {
-      showNotification("Please load WGCNA data in Tab 4 first.", type = "error")
+      showNotification("Run WGCNA in this app before GSEA.", type = "error")
       return()
     }
     
@@ -1138,12 +1090,14 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Require user to upload the analyte info file for this session
-    if (is.null(input$analyte_info_file)) {
-      showNotification("Please upload the Analyte Info TSV file to run GSEA.", type = "error")
+    analyte_file_path <- pipeline_data$analyte_info
+    if (is.null(analyte_file_path) && file.exists(file.path("data", "CSF_SOMAscan7k_analyte_information.tsv"))) {
+      analyte_file_path <- file.path("data", "CSF_SOMAscan7k_analyte_information.tsv")
+    }
+    if (is.null(analyte_file_path)) {
+      showNotification("Upload analyte annotation on Tab 1 before running GSEA.", type = "error")
       return()
     }
-    analyte_file_path <- input$analyte_info_file$datapath
     
     if (is.null(input$gsea_module) || !nzchar(input$gsea_module)) {
       showNotification("Please select a module for GSEA.", type = "error")
@@ -1191,7 +1145,7 @@ server <- function(input, output, session) {
   # --- Server Logic for Tab 9: ORA ---
   observeEvent(input$run_ora_btn, {
     if (is.null(pipeline_data$loaded_data)) {
-      showNotification("Please load WGCNA data in Tab 4 first.", type = "error")
+      showNotification("Run WGCNA in this app before ORA.", type = "error")
       return()
     }
     
@@ -1200,12 +1154,14 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Require user to upload the analyte info file for this session
-    if (is.null(input$analyte_info_file)) {
-      showNotification("Please upload the Analyte Info TSV file on the GSEA tab to run ORA.", type = "error")
+    analyte_file_path <- pipeline_data$analyte_info
+    if (is.null(analyte_file_path) && file.exists(file.path("data", "CSF_SOMAscan7k_analyte_information.tsv"))) {
+      analyte_file_path <- file.path("data", "CSF_SOMAscan7k_analyte_information.tsv")
+    }
+    if (is.null(analyte_file_path)) {
+      showNotification("Upload analyte annotation on Tab 1 before running ORA.", type = "error")
       return()
     }
-    analyte_file_path <- input$analyte_info_file$datapath
     
     if (is.null(input$ora_module) || !nzchar(input$ora_module)) {
       showNotification("Please select a module for ORA.", type = "error")

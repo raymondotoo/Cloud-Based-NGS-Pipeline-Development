@@ -339,7 +339,7 @@ run_gsea_analysis <- function(wgcna_objects, analyte_info_path, target_module, m
     rownames(datKME) <- colnames(expr)
 
     # Annotation Mapping (SOMAmer -> Entrez)
-    analyte_info <- read.delim(analyte_info_path, sep = "\t", header = TRUE, check.names = FALSE)
+    analyte_info <- resolve_analyte_info(analyte_info_path)
     
     feature_key <- analyte_info %>%
       dplyr::filter(Analytes %in% colnames(expr)) %>%
@@ -431,7 +431,7 @@ run_ora_analysis <- function(wgcna_objects, analyte_info_path, target_module) {
     if(is.null(names(moduleColors))) names(moduleColors) <- colnames(expr)
 
     # --- ID Mapping (similar to GSEA helper) ---
-    analyte_info <- read.delim(analyte_info_path, sep = "\t", header = TRUE, check.names = FALSE)
+    analyte_info <- resolve_analyte_info(analyte_info_path)
     
     feature_key <- analyte_info %>%
       dplyr::filter(Analytes %in% colnames(expr)) %>%
@@ -512,6 +512,68 @@ plot_ora_results <- function(sig_ora_df, module_name) {
 
 # --- Helper for Data Preprocessing (aligned to 00_Data_preprocessing.Rmd) ---
 
+canonical_wmh_vars <- function() {
+  c("wmh_juxta", "wmh_frontal", "wmh_pv", "wmh_parietal", "wmh_posterior")
+}
+
+compute_wmh_pca <- function(pheno_df) {
+  wmh_vars <- canonical_wmh_vars()
+  if (!all(wmh_vars %in% colnames(pheno_df))) {
+    return(NULL)
+  }
+
+  pca_input <- pheno_df[, wmh_vars, drop = FALSE]
+  keep <- stats::complete.cases(pca_input)
+  if (sum(keep) < 3) {
+    return(NULL)
+  }
+
+  pca_res <- stats::prcomp(scale(pca_input[keep, , drop = FALSE]), center = TRUE, scale. = TRUE)
+  pca_scores <- as.data.frame(pca_res$x[, 1:3, drop = FALSE])
+  pca_scores$PC1 <- -pca_scores$PC1
+  pca_scores$SampleID <- rownames(pca_input)[keep]
+  pca_scores <- pca_scores[, c("SampleID", "PC1", "PC2", "PC3")]
+
+  list(
+    pca = pca_res,
+    scores = pca_scores,
+    vars = wmh_vars
+  )
+}
+
+build_canonical_pheno <- function(pheno_df) {
+  expected_cols <- c(
+    "Cohort", "Sex", "Age_at_draw", "PC1", "PC2", "PC3", "SBP", "DM2",
+    "HTNscore", "bmi", "fsrp", "d_cmb", "lacunar_stroke", "stroke",
+    "caa_diag", "caa", "E4", "closest_cdr", "cdr_sob", "AD_status",
+    "cog_status"
+  )
+
+  keep <- intersect(expected_cols, colnames(pheno_df))
+  pheno_out <- pheno_df[, keep, drop = FALSE]
+
+  if ("Sex" %in% colnames(pheno_out)) {
+    pheno_out$Sex <- ifelse(as.character(pheno_out$Sex) == "Male", 1, 0)
+  }
+  if ("Cohort" %in% colnames(pheno_out)) {
+    pheno_out$Cohort_bin <- ifelse(as.character(pheno_out$Cohort) == "ADNI", 1, 0)
+  }
+  if ("caa_diag" %in% colnames(pheno_out)) {
+    pheno_out$caa_prob <- ifelse(as.character(pheno_out$caa_diag) == "probable", 1, 0)
+  }
+  if ("closest_cdr" %in% colnames(pheno_out)) {
+    pheno_out$closest_cdr <- ifelse(as.character(pheno_out$closest_cdr) == "0" | pheno_out$closest_cdr == 0, 0, 1)
+  }
+  if ("lacunar_stroke" %in% colnames(pheno_out)) {
+    pheno_out$lacunar_stroke <- ifelse(as.character(pheno_out$lacunar_stroke) == "0" | pheno_out$lacunar_stroke == 0, 0, 1)
+  }
+  if ("E4" %in% colnames(pheno_out)) {
+    pheno_out$E4status <- ifelse(as.character(pheno_out$E4) == "0" | pheno_out$E4 == 0, 0, 1)
+  }
+
+  pheno_out
+}
+
 run_preprocessing <- function(proto_df, pheno_df, impute_method = "Hybrid") {
   # 0. Standardize ID columns
   get_id_col <- function(df) {
@@ -537,6 +599,23 @@ run_preprocessing <- function(proto_df, pheno_df, impute_method = "Hybrid") {
   
   rownames(proto_df) <- proto_df$SampleID
   rownames(pheno_df) <- pheno_df$SampleID
+
+  # 0b. Canonical WMH PCA from phenotype data, matching 02b + 00 merge/flip logic
+  wmh_pca <- compute_wmh_pca(pheno_df)
+  if (!is.null(wmh_pca)) {
+    matched <- match(pheno_df$SampleID, wmh_pca$scores$SampleID)
+    for (pc in c("PC1", "PC2", "PC3")) {
+      pheno_df[[pc]] <- wmh_pca$scores[[pc]][matched]
+    }
+  }
+
+  # 0c. Restrict to SOMA panel if available, matching the original workflow
+  if ("Panel.SOMA" %in% colnames(proto_df)) {
+    proto_df <- proto_df[proto_df$Panel.SOMA == 1, , drop = FALSE]
+  }
+  if ("Panel.SOMA" %in% colnames(pheno_df)) {
+    pheno_df <- pheno_df[pheno_df$Panel.SOMA == 1, , drop = FALSE]
+  }
   
   # 1. Prepare Expression Matrix (Logic from 02a_ADNI_ADRC_harmonized.Rmd)
   
@@ -622,42 +701,16 @@ run_preprocessing <- function(proto_df, pheno_df, impute_method = "Hybrid") {
   
   processed_proto <- processed_proto[common_ids, ]
   expr_raw_filtered <- expr_raw_filtered[common_ids, ]
-  pheno_df <- pheno_df[common_ids, ]
+  pheno_aligned <- pheno_df[common_ids, , drop = FALSE]
+  pheno_model <- build_canonical_pheno(pheno_aligned)
   
-  # 4. Study-Specific Transformations (matching 00_Data_preprocessing.Rmd)
-  # Ensure specific columns are binarized/renamed if they exist
-  
-  # Sex: Male=1, Female=0
-  if("Sex" %in% colnames(pheno_df)) {
-    pheno_df$Sex <- ifelse(pheno_df$Sex == "Male", 1, 0)
-  }
-  
-  # Cohort: ADNI=1, ADRC=0 (Create Cohort_bin but keep Cohort for ComBat)
-  if("Cohort" %in% colnames(pheno_df)) {
-    pheno_df$Cohort_bin <- ifelse(pheno_df$Cohort == "ADNI", 1, 0)
-  }
-  
-  # caa_diag -> caa_prob (probable=1, else 0)
-  if("caa_diag" %in% colnames(pheno_df)) {
-    pheno_df$caa_prob <- ifelse(pheno_df$caa_diag == "probable", 1, 0)
-  }
-  
-  # closest_cdr: 0=0, >0=1
-  if("closest_cdr" %in% colnames(pheno_df)) {
-    pheno_df$closest_cdr <- ifelse(pheno_df$closest_cdr == 0 | pheno_df$closest_cdr == "0", 0, 1)
-  }
-  
-  # lacunar_stroke: 0=0, >0=1
-  if("lacunar_stroke" %in% colnames(pheno_df)) {
-    pheno_df$lacunar_stroke <- ifelse(pheno_df$lacunar_stroke == 0 | pheno_df$lacunar_stroke == "0", 0, 1)
-  }
-  
-  # E4 -> E4status: 0=0, >0=1
-  if("E4" %in% colnames(pheno_df)) {
-    pheno_df$E4status <- ifelse(pheno_df$E4 == 0 | pheno_df$E4 == "0", 0, 1)
-  }
-  
-  return(list(expr = processed_proto, pheno = pheno_df, expr_raw = expr_raw_filtered))
+  return(list(
+    expr = processed_proto,
+    expr_raw = expr_raw_filtered,
+    pheno = pheno_model,
+    pheno_raw = pheno_aligned,
+    wmh_pca = wmh_pca
+  ))
 }
 
 plot_missingness <- function(df) {
@@ -725,10 +778,17 @@ run_harmonization <- function(expr_data, pheno_data, batch_col) {
   
   # Run ComBat
   mod <- model.matrix(~1, data = pheno_data)
+  pca_before <- stats::prcomp(expr_data[, is_num, drop = FALSE], scale. = TRUE)
   combat_edata <- sva::ComBat(dat = dat, batch = batch, mod = mod, par.prior = TRUE, prior.plots = FALSE)
+  harmonized_expr <- t(combat_edata)
+  pca_after <- stats::prcomp(harmonized_expr, scale. = TRUE)
   
-  # Return as samples x features
-  return(t(combat_edata))
+  list(
+    expr = harmonized_expr,
+    pheno = pheno_data,
+    pca_before = pca_before,
+    pca_after = pca_after
+  )
 }
 
 plot_pca_batch <- function(expr_data, pheno_data, batch_col, title_prefix = "PCA") {
@@ -773,6 +833,13 @@ run_pca_analysis <- function(expr_data) {
   is_num <- sapply(expr_data, is.numeric)
   pca <- prcomp(expr_data[, is_num], scale. = TRUE)
   return(pca)
+}
+
+resolve_analyte_info <- function(analyte_info_input) {
+  if (is.data.frame(analyte_info_input)) {
+    return(analyte_info_input)
+  }
+  read.delim(analyte_info_input, sep = "\t", header = TRUE, check.names = FALSE)
 }
 
 plot_pca_scree <- function(pca_obj) {
