@@ -87,21 +87,26 @@ ui <- tagList(
                           verbatimTextOutput("input_status_output"),
                           hr(),
                           h3("Preprocessing Diagnostics"),
-                          div(class = "analysis-card",
-                              h4("Missingness Overview"),
-                              p(class = "section-note", "Distribution of missing values per protein prior to imputation."),
-                              plotOutput("missingness_plot", height = "400px"),
-                              downloadButton("dl_missing_plot", "Download Plot")
-                          ),
-                          div(class = "analysis-card",
-                              h4("Imputation Effect"),
-                              p(class = "section-note", "Before vs after imputation density comparison."),
-                              plotOutput("impute_dist_plot", height = "400px"),
-                              downloadButton("dl_impute_plot", "Download Plot")
-                          ),
-                          div(class = "analysis-card",
-                              h4("Processed Data Preview"),
-                              DT::dataTableOutput("preview_processed_data")
+                          tabsetPanel(
+                            tabPanel("Missingness",
+                                     div(class = "analysis-card",
+                                         h4("Missingness Overview"),
+                                         p(class = "section-note", "Distribution of missing values per protein prior to imputation."),
+                                         plotOutput("missingness_plot", height = "420px"),
+                                         downloadButton("dl_missing_plot", "Download Plot")
+                                     )),
+                            tabPanel("Imputation",
+                                     div(class = "analysis-card",
+                                         h4("Imputation Effect"),
+                                         p(class = "section-note", "Before vs after imputation density comparison."),
+                                         plotOutput("impute_dist_plot", height = "420px"),
+                                         downloadButton("dl_impute_plot", "Download Plot")
+                                     )),
+                            tabPanel("Preview",
+                                     div(class = "analysis-card",
+                                         h4("Processed Data Preview"),
+                                         DT::dataTableOutput("preview_processed_data")
+                                     ))
                           )
                         )
                       )
