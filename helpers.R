@@ -825,9 +825,7 @@ plot_ora_cnet <- function(ora_bundle, source_name, padj_cutoff = 0.05, top_n = 5
 
   enrichplot::cnetplot(
     enrich_obj,
-    showCategory = min(top_n, nrow(enrich_obj@result)),
-    circular = FALSE,
-    colorEdge = TRUE
+    showCategory = min(top_n, nrow(enrich_obj@result))
   ) +
     ggplot2::labs(
       title = paste("ORA concept network:", ora_bundle$module, "module"),
