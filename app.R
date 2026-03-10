@@ -87,15 +87,22 @@ ui <- tagList(
                           verbatimTextOutput("input_status_output"),
                           hr(),
                           h3("Preprocessing Diagnostics"),
-                          plotOutput("missingness_plot", height = "400px"),
-                          downloadButton("dl_missing_plot", "Download Plot"),
-                          hr(),
-                          h4("Imputation Effect"),
-                          plotOutput("impute_dist_plot", height = "400px"),
-                          downloadButton("dl_impute_plot", "Download Plot"),
-                          hr(),
-                          h4("Processed Data Preview"),
-                          DT::dataTableOutput("preview_processed_data")
+                          div(class = "analysis-card",
+                              h4("Missingness Overview"),
+                              p(class = "section-note", "Distribution of missing values per protein prior to imputation."),
+                              plotOutput("missingness_plot", height = "400px"),
+                              downloadButton("dl_missing_plot", "Download Plot")
+                          ),
+                          div(class = "analysis-card",
+                              h4("Imputation Effect"),
+                              p(class = "section-note", "Before vs after imputation density comparison."),
+                              plotOutput("impute_dist_plot", height = "400px"),
+                              downloadButton("dl_impute_plot", "Download Plot")
+                          ),
+                          div(class = "analysis-card",
+                              h4("Processed Data Preview"),
+                              DT::dataTableOutput("preview_processed_data")
+                          )
                         )
                       )
              ),
@@ -315,18 +322,13 @@ ui <- tagList(
                             sliderInput("ml_alpha", "Elastic Net Alpha", value = 0.5, min = 0, max = 1)
                           ),
                           actionButton("run_ml_btn", "Run ML Model", class = "btn-primary"),
+                          actionButton("ml_help", "Computation Notes", class = "btn-link"),
                           hr(),
                           wellPanel(
                               h4("About This Step"),
                               p("This step uses the module eigengenes (MEs) as features to predict a clinical outcome (e.g., 'stroke'). Using MEs instead of thousands of individual proteins drastically reduces the number of features, mitigates multiple testing issues, and incorporates biological structure into the model."),
                               p("Multiple model options are available. Elastic Net remains the default because it balances interpretability with predictive performance on correlated module eigengenes."),
-                              h4("Computation Notes"),
-                              tags$ul(
-                                tags$li("Elastic Net: 5-fold CV on standardized eigengenes using glmnet; coefficients are reported at lambda.min."),
-                                tags$li("Logistic Regression: GLM with binomial link on standardized eigengenes; coefficients are reported directly."),
-                                tags$li("Random Forest: default randomForest settings on standardized eigengenes; variable importance is reported.")
-                              ),
-                              p("All models use a train/test split and are evaluated with ROC AUC and a 0.5 decision threshold for the confusion matrix.")
+                              p("Use the Computation Notes help button for model details.")
                           )
                         ),
                         mainPanel(
@@ -862,6 +864,20 @@ server <- function(input, output, session) {
       title = "Why flip a principal component?",
       p("PCA axes are arbitrary up to sign: multiplying a component by -1 does not change the variance explained or relationships between samples."),
       p("Flipping a component can make plots align with expected biological directionality or match other references."),
+      easyClose = TRUE,
+      footer = modalButton("Close")
+    ))
+  })
+
+  observeEvent(input$ml_help, {
+    showModal(modalDialog(
+      title = "Computation Notes",
+      tags$ul(
+        tags$li("Elastic Net: 5-fold CV on standardized eigengenes using glmnet; coefficients are reported at lambda.min."),
+        tags$li("Logistic Regression: GLM with binomial link on standardized eigengenes; coefficients are reported directly."),
+        tags$li("Random Forest: default randomForest settings on standardized eigengenes; variable importance is reported.")
+      ),
+      p("All models use a train/test split and are evaluated with ROC AUC and a 0.5 decision threshold for the confusion matrix."),
       easyClose = TRUE,
       footer = modalButton("Close")
     ))
