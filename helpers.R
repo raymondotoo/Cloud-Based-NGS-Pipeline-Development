@@ -3,6 +3,19 @@
 # This file contains the core analysis logic adapted from the R Markdown scripts.
 #
 
+app_theme <- function(base_size = 12) {
+  ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major.x = ggplot2::element_line(color = "#e2e8f0"),
+      panel.grid.major.y = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(face = "bold"),
+      plot.subtitle = ggplot2::element_text(color = "#475569"),
+      strip.background = ggplot2::element_rect(fill = "#e2e8f0", color = NA),
+      legend.title = ggplot2::element_text(face = "bold")
+    )
+}
+
 
 # --- Helper for WGCNA (aligned to 03_WGCNA_running.Rmd) ---
 
@@ -90,12 +103,15 @@ plot_scale_free_topology <- function(sft) {
     text(0.5, 0.5, "Run Soft Threshold Analysis first.")
     return()
   }
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  par(mar = c(5, 5, 3, 1))
   plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
        xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
        main = paste("Scale independence"));
   text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
-       labels=sft$fitIndices[,1],cex=0.9,col="red");
-  abline(h=0.85,col="red")
+       labels=sft$fitIndices[,1],cex=0.9,col="#9f1239");
+  abline(h=0.85,col="#9f1239", lty = 2)
 }
 
 plot_mean_connectivity <- function(sft) {
@@ -104,14 +120,20 @@ plot_mean_connectivity <- function(sft) {
     text(0.5, 0.5, "Run Soft Threshold Analysis first.")
     return()
   }
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  par(mar = c(5, 5, 3, 1))
   plot(sft$fitIndices[,1], sft$fitIndices[,5],
        xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
        main = paste("Mean connectivity"))
-  text(sft$fitIndices[,1], sft$fitIndices[,5], labels=sft$fitIndices[,1], cex=0.9,col="red")
+  text(sft$fitIndices[,1], sft$fitIndices[,5], labels=sft$fitIndices[,1], cex=0.9,col="#0f766e")
 }
 
 plot_sample_tree <- function(expr) {
   sampleTree <- hclust(dist(expr), method = "average")
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  par(mar = c(5, 4, 3, 1))
   plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="")
 }
 
@@ -477,30 +499,33 @@ plot_gsea_results <- function(gsea_bundle, padj_cutoff = 0.05, source_name = "Al
     dplyr::slice_max(order_by = abs(NES), n = top_n, with_ties = FALSE) %>%
     dplyr::ungroup()
 
+  top_res$pathway_clean <- reorder(top_res$pathway_clean, top_res$NES)
+
   ggplot2::ggplot(
     top_res,
     ggplot2::aes(
       x = NES,
-      y = reorder(pathway_clean, NES),
-      size = -log10(padj),
-      color = NES
+      y = pathway_clean,
+      fill = NES
     )
   ) +
-    ggplot2::geom_point(alpha = 0.9) +
-    ggplot2::facet_wrap(~Source, scales = "free_y") +
-    ggplot2::scale_color_gradient2(low = "#155e75", mid = "#f8fafc", high = "#9f1239") +
-    ggplot2::theme_bw(base_size = 12) +
-    ggplot2::theme(
-      panel.grid.minor = ggplot2::element_blank(),
-      strip.background = ggplot2::element_rect(fill = "#e2e8f0", color = NA),
-      plot.title = ggplot2::element_text(face = "bold")
+    ggplot2::geom_col(width = 0.8) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = sprintf("padj %.3g", padj)),
+      hjust = ifelse(top_res$NES >= 0, -0.1, 1.1),
+      size = 3.2,
+      color = "#334155"
     ) +
+    ggplot2::facet_wrap(~Source, scales = "free_y") +
+    ggplot2::scale_fill_gradient2(low = "#155e75", mid = "#e2e8f0", high = "#9f1239") +
+    app_theme() +
     ggplot2::labs(
       title = paste("FGSEA pathway overview:", gsea_bundle$module, "module"),
       x = "Normalized enrichment score",
       y = NULL,
-      size = "-log10(adj. p)"
-    )
+      fill = "NES"
+    ) +
+    ggplot2::coord_cartesian(clip = "off")
 }
 
 plot_gsea_network <- function(gsea_bundle, source_name, padj_cutoff = 0.05, n_pathways = 5) {
@@ -569,7 +594,7 @@ plot_gsea_enrichment_curve <- function(gsea_bundle, source_name, pathway_name = 
         " | padj = ", format.pval(pathway_stats$padj, digits = 3)
       )
     ) +
-    ggplot2::theme_bw(base_size = 12) +
+    app_theme() +
     ggplot2::theme(
       plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
       plot.subtitle = ggplot2::element_text(hjust = 0.5),
@@ -691,31 +716,27 @@ plot_ora_results <- function(ora_bundle, padj_cutoff = 0.05, source_name = "All"
     top_res,
     ggplot2::aes(
       x = GeneRatioNumeric,
-      y = reorder(pathway_clean, GeneRatioNumeric)
+      y = reorder(pathway_clean, GeneRatioNumeric),
+      fill = -log10(p.adjust)
     )
   ) +
-    ggplot2::geom_segment(
-      ggplot2::aes(x = 0, xend = GeneRatioNumeric, yend = pathway_clean),
-      color = "#cbd5e1"
-    ) +
-    ggplot2::geom_point(
-      ggplot2::aes(size = Count, color = -log10(p.adjust)),
-      alpha = 0.95
+    ggplot2::geom_col(width = 0.8) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = paste0("n=", Count)),
+      hjust = -0.1,
+      size = 3.2,
+      color = "#334155"
     ) +
     ggplot2::facet_wrap(~Source, scales = "free_y") +
-    ggplot2::scale_color_gradient(low = "#fbbf24", high = "#9f1239") +
-    ggplot2::theme_bw(base_size = 12) +
-    ggplot2::theme(
-      panel.grid.minor = ggplot2::element_blank(),
-      strip.background = ggplot2::element_rect(fill = "#e2e8f0", color = NA),
-      plot.title = ggplot2::element_text(face = "bold")
-    ) +
+    ggplot2::scale_fill_gradient(low = "#fbbf24", high = "#9f1239") +
+    app_theme() +
     ggplot2::labs(
       title = paste("ORA term overview:", ora_bundle$module, "module"),
       x = "Gene ratio",
       y = NULL,
-      color = "-log10(adj. p)"
-    )
+      fill = "-log10(adj. p)"
+    ) +
+    ggplot2::coord_cartesian(clip = "off")
 }
 
 plot_ora_cnet <- function(ora_bundle, source_name, padj_cutoff = 0.05, top_n = 5) {
@@ -1006,7 +1027,7 @@ plot_supp_preservation <- function(supp_bundle) {
     ggplot2::geom_point(ggplot2::aes(color = is_key), size = 3) +
     ggrepel::geom_text_repel(ggplot2::aes(label = Module), size = 3.5, max.overlaps = 15) +
     ggplot2::scale_color_manual(values = c(Key = "#9f1239", Other = "#475569")) +
-    ggplot2::theme_bw(base_size = 12) +
+    app_theme() +
     ggplot2::labs(
       title = "Module preservation: ADNI to ADRC",
       subtitle = "Zsummary versus module size",
@@ -1045,7 +1066,7 @@ plot_supp_forest <- function(supp_bundle) {
     ) +
     ggplot2::geom_point(position = ggplot2::position_dodge(width = 0.5), size = 3) +
     ggplot2::scale_color_manual(values = c(Unadj_Beta = "#0f766e", Adj_Beta = "#9f1239")) +
-    ggplot2::theme_bw(base_size = 12) +
+    app_theme() +
     ggplot2::labs(
       title = "Sensitivity analysis with AD adjustment",
       subtitle = "95% confidence intervals around adjusted effect estimates",
@@ -1320,9 +1341,14 @@ plot_missingness <- function(df) {
   df_plot <- data.frame(Protein = names(missing_counts), MissingCount = missing_counts)
   
   ggplot2::ggplot(df_plot, ggplot2::aes(x = MissingCount)) +
-    ggplot2::geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
-    ggplot2::theme_bw() +
-    ggplot2::labs(title = "Distribution of Missing Values per Protein", x = "Number of Missing Samples", y = "Count of Proteins")
+    ggplot2::geom_histogram(binwidth = 1, fill = "#0f766e", color = "white") +
+    app_theme() +
+    ggplot2::labs(
+      title = "Distribution of missing values per protein",
+      subtitle = "Quality-control view before downstream harmonization",
+      x = "Number of missing samples",
+      y = "Count of proteins"
+    )
 }
 
 plot_imputation_distribution <- function(expr_raw, expr_imputed) {
@@ -1339,9 +1365,14 @@ plot_imputation_distribution <- function(expr_raw, expr_imputed) {
   
   ggplot2::ggplot(df_plot, ggplot2::aes(x = Value, fill = Type)) +
     ggplot2::geom_density(alpha = 0.5) +
-    ggplot2::theme_bw() +
-    ggplot2::labs(title = "Data Distribution Before and After Imputation", x = "Intensity", y = "Density") +
-    ggplot2::scale_fill_manual(values = c("Before Imputation" = "grey", "After Imputation" = "red"))
+    app_theme() +
+    ggplot2::labs(
+      title = "Signal distribution before and after imputation",
+      subtitle = "Comparing observed intensities with the imputed expression matrix",
+      x = "Intensity",
+      y = "Density"
+    ) +
+    ggplot2::scale_fill_manual(values = c("Before Imputation" = "#94a3b8", "After Imputation" = "#9f1239"))
 }
 
 # --- Helper for Harmonization (ComBat) ---
@@ -1431,8 +1462,12 @@ plot_pca_batch <- function(expr_data, pheno_data, batch_col, title_prefix = "PCA
   
   ggplot2::ggplot(df_plot, ggplot2::aes(x = PC1, y = PC2, color = Batch)) +
     ggplot2::geom_point(alpha = 0.7, size = 2) +
-    ggplot2::theme_bw() +
-    ggplot2::labs(title = paste(title_prefix, "- Colored by", batch_col), color = batch_col)
+    app_theme() +
+    ggplot2::labs(
+      title = paste(title_prefix, "PCA"),
+      subtitle = paste("Samples colored by", batch_col),
+      color = batch_col
+    )
 }
 
 # --- Helper for PCA (Full Analysis) ---
@@ -1458,11 +1493,16 @@ plot_pca_scree <- function(pca_obj) {
   df_plot <- head(df_plot, 10)
   
   ggplot2::ggplot(df_plot, ggplot2::aes(x = factor(PC), y = Variance)) +
-    ggplot2::geom_bar(stat = "identity", fill = "steelblue") +
-    ggplot2::geom_line(ggplot2::aes(group = 1), color = "red") +
-    ggplot2::geom_point(color = "red") +
-    ggplot2::theme_bw() +
-    ggplot2::labs(title = "Scree Plot (Top 10 PCs)", x = "Principal Component", y = "Proportion of Variance Explained")
+    ggplot2::geom_col(fill = "#0f766e") +
+    ggplot2::geom_line(ggplot2::aes(group = 1), color = "#9f1239") +
+    ggplot2::geom_point(color = "#9f1239") +
+    app_theme() +
+    ggplot2::labs(
+      title = "Scree plot",
+      subtitle = "Variance explained by the first 10 principal components",
+      x = "Principal component",
+      y = "Proportion of variance explained"
+    )
 }
 
 plot_pca_scatter_custom <- function(pca_obj, pheno_data, color_col) {
@@ -1476,7 +1516,10 @@ plot_pca_scatter_custom <- function(pca_obj, pheno_data, color_col) {
   } else {
     p <- ggplot2::ggplot(df_plot, ggplot2::aes(x = PC1, y = PC2))
   }
-  p + ggplot2::geom_point(alpha = 0.7, size = 2) + ggplot2::theme_bw() + ggplot2::labs(title = "PCA: PC1 vs PC2")
+  p + ggplot2::geom_point(alpha = 0.7, size = 2) + app_theme() + ggplot2::labs(
+    title = "PCA projection",
+    subtitle = "Samples projected onto the first two components"
+  )
 }
 
 plot_pca_biplot <- function(pca_obj, title_prefix = "PCA Biplot") {
@@ -1514,7 +1557,7 @@ plot_pca_biplot <- function(pca_obj, title_prefix = "PCA Biplot") {
       color = "red",
       size = 4
     ) +
-    ggplot2::theme_bw() +
+    app_theme() +
     ggplot2::labs(
       title = title_prefix,
       x = paste0("PC1 (", round(var_expl[1], 1), "%)"),

@@ -122,8 +122,8 @@ ui <- tagList(
                         mainPanel(
                           h3("Harmonization Results"),
                           fluidRow(
-                            column(6, h4("Before Correction"), plotOutput("pca_before_combat")),
-                            column(6, h4("After Correction"), plotOutput("pca_after_combat"))
+                            column(6, h4("Before Correction"), plotOutput("pca_before_combat"), downloadButton("dl_combat_before_plot", "Download Before Plot")),
+                            column(6, h4("After Correction"), plotOutput("pca_after_combat"), downloadButton("dl_combat_after_plot", "Download After Plot"))
                           ),
                           downloadButton("dl_combat_plots", "Download Comparison Plots")
                         )
@@ -299,6 +299,7 @@ ui <- tagList(
                               h3("Model Performance"),
                               verbatimTextOutput("ml_cm_output"),
                               plotOutput("ml_roc_plot"),
+                              downloadButton("dl_ml_roc_plot", "Download ROC Plot"),
                               h3("Top Predictors"),
                               DT::dataTableOutput("ml_coeffs_output")
                           )
@@ -340,20 +341,23 @@ ui <- tagList(
                               div(class = "analysis-card",
                                   h4("Pathway Overview"),
                                   p(class = "section-note", "A ranked summary of significant pathway enrichments across Hallmark, Reactome, and GO biological process gene sets."),
-                                  plotOutput("gsea_dotplot_output", height = "520px")
+                                  plotOutput("gsea_dotplot_output", height = "520px"),
+                                  downloadButton("dl_gsea_overview_plot", "Download Overview Plot")
                               ),
                               tabsetPanel(
                                 tabPanel("Network",
                                          div(class = "analysis-card",
                                              h4("Leading-Edge Network"),
                                              p(class = "section-note", "Connections between the strongest enriched pathways and the proteins driving them."),
-                                             plotOutput("gsea_network_output", height = "620px")
+                                             plotOutput("gsea_network_output", height = "620px"),
+                                             downloadButton("dl_gsea_network_plot", "Download Network Plot")
                                          )),
                                 tabPanel("Enrichment Curve",
                                          div(class = "analysis-card",
                                              h4("Running Score Plot"),
                                              p(class = "section-note", "The FGSEA running enrichment curve for a selected pathway."),
-                                             plotOutput("gsea_curve_output", height = "500px")
+                                             plotOutput("gsea_curve_output", height = "500px"),
+                                             downloadButton("dl_gsea_curve_plot", "Download Enrichment Plot")
                                          )),
                                 tabPanel("Results Table",
                                          div(class = "analysis-card",
@@ -398,14 +402,16 @@ ui <- tagList(
                               div(class = "analysis-card",
                                   h4("Term Overview"),
                                   p(class = "section-note", "Prioritized GO, KEGG, and Reactome terms for the selected module."),
-                                  plotOutput("ora_dotplot_output", height = "520px")
+                                  plotOutput("ora_dotplot_output", height = "520px"),
+                                  downloadButton("dl_ora_overview_plot", "Download Overview Plot")
                               ),
                               tabsetPanel(
                                 tabPanel("Concept Network",
                                          div(class = "analysis-card",
                                              h4("Functional Network"),
                                              p(class = "section-note", "A cnet-style view linking enriched terms to the genes in the module."),
-                                             plotOutput("ora_cnet_output", height = "620px")
+                                             plotOutput("ora_cnet_output", height = "620px"),
+                                             downloadButton("dl_ora_cnet_plot", "Download Network Plot")
                                          )),
                                 tabPanel("Hub Genes",
                                          div(class = "analysis-card",
@@ -453,18 +459,21 @@ ui <- tagList(
                                          div(class = "analysis-card",
                                              h4("Module Preservation"),
                                              plotOutput("supp_preservation_plot", height = "500px"),
+                                             downloadButton("dl_supp_preservation_plot", "Download Preservation Plot"),
                                              DT::dataTableOutput("supp_preservation_table")
                                          )),
                                 tabPanel("Sensitivity",
                                          div(class = "analysis-card",
                                              h4("AD-Adjusted Sensitivity"),
                                              plotOutput("supp_forest_plot", height = "500px"),
+                                             downloadButton("dl_supp_forest_plot", "Download Sensitivity Plot"),
                                              DT::dataTableOutput("supp_sensitivity_table")
                                          )),
                                 tabPanel("Hub Proteins",
                                          div(class = "analysis-card",
                                              h4("Module Membership Hubs"),
                                              plotOutput("supp_hub_plot", height = "560px"),
+                                             downloadButton("dl_supp_hub_plot", "Download Hub Plot"),
                                              DT::dataTableOutput("supp_kme_table")
                                          )),
                                 tabPanel("Cohort Heatmaps",
@@ -472,12 +481,14 @@ ui <- tagList(
                                            column(12,
                                                   div(class = "analysis-card",
                                                       h4("ADNI"),
-                                                      plotOutput("supp_heatmap_adni", height = "520px")
+                                                      plotOutput("supp_heatmap_adni", height = "520px"),
+                                                      downloadButton("dl_supp_heatmap_adni", "Download ADNI Heatmap")
                                                   )),
                                            column(12,
                                                   div(class = "analysis-card",
                                                       h4("ADRC"),
-                                                      plotOutput("supp_heatmap_adrc", height = "520px")
+                                                      plotOutput("supp_heatmap_adrc", height = "520px"),
+                                                      downloadButton("dl_supp_heatmap_adrc", "Download ADRC Heatmap")
                                                   ))
                                          ))
                               )
@@ -493,6 +504,11 @@ ui <- tagList(
 # --------------------------
 
 server <- function(input, output, session) {
+  save_current_plot <- function(file, expr, width = 10, height = 7) {
+    grDevices::pdf(file, width = width, height = height, useDingbats = FALSE)
+    on.exit(grDevices::dev.off(), add = TRUE)
+    force(expr)
+  }
   
   # Reactive values to store data and results across steps
   pipeline_data <- reactiveValues(
@@ -509,6 +525,7 @@ server <- function(input, output, session) {
     pca_samples = NULL,
     wgcna_results = NULL,
     trait_cor_results = NULL,
+    ml_results = NULL,
     gsea_results = NULL,
     ora_results = NULL,
     supp_results = NULL,
@@ -559,6 +576,7 @@ server <- function(input, output, session) {
       pipeline_data$wgcna_results <- NULL
       pipeline_data$trait_cor_results <- NULL
       pipeline_data$sft_results <- NULL
+      pipeline_data$ml_results <- NULL
       pipeline_data$gsea_results <- NULL
       pipeline_data$ora_results <- NULL
       pipeline_data$supp_results <- NULL
@@ -595,6 +613,7 @@ server <- function(input, output, session) {
       pipeline_data$harmonized <- NULL
       pipeline_data$harmonized_expr <- NULL
       pipeline_data$loaded_data <- NULL
+      pipeline_data$ml_results <- NULL
       pipeline_data$gsea_results <- NULL
       pipeline_data$ora_results <- NULL
       pipeline_data$supp_results <- NULL
@@ -696,6 +715,32 @@ server <- function(input, output, session) {
       print(plot_pca_batch(pipeline_data$processed_data$expr, pipeline_data$processed_data$pheno, input$batch_col, "Before"))
       print(plot_pca_batch(as.data.frame(pipeline_data$harmonized_expr), pipeline_data$harmonized$pheno, input$batch_col, "After"))
       dev.off()
+    }
+  )
+
+  output$dl_combat_before_plot <- downloadHandler(
+    filename = "combat_before_pca.pdf",
+    content = function(file) {
+      req(pipeline_data$processed_data, input$batch_col)
+      save_current_plot(file, print(plot_pca_batch(
+        pipeline_data$processed_data$expr,
+        pipeline_data$processed_data$pheno,
+        input$batch_col,
+        "Before ComBat"
+      )), width = 8, height = 6)
+    }
+  )
+
+  output$dl_combat_after_plot <- downloadHandler(
+    filename = "combat_after_pca.pdf",
+    content = function(file) {
+      req(pipeline_data$harmonized_expr, input$batch_col)
+      save_current_plot(file, print(plot_pca_batch(
+        as.data.frame(pipeline_data$harmonized_expr),
+        pipeline_data$harmonized$pheno,
+        input$batch_col,
+        "After ComBat"
+      )), width = 8, height = 6)
     }
   )
   
@@ -1050,6 +1095,7 @@ server <- function(input, output, session) {
         pipeline_data$gsea_results <- NULL
         pipeline_data$ora_results <- NULL
         pipeline_data$supp_results <- NULL
+        pipeline_data$ml_results <- NULL
         
         # Update GSEA module selector
         modules <- setdiff(unique(res$moduleColors), "grey")
@@ -1176,6 +1222,7 @@ server <- function(input, output, session) {
     })
     
     if (!is.null(ml_results)) {
+      pipeline_data$ml_results <- ml_results
       output$ml_cm_output <- renderPrint({
         print(ml_results$confusion_matrix)
       })
@@ -1189,6 +1236,19 @@ server <- function(input, output, session) {
       })
     }
   })
+
+  output$dl_ml_roc_plot <- downloadHandler(
+    filename = function() { paste0("ml_roc_", input$ml_target_col, ".pdf") },
+    content = function(file) {
+      req(pipeline_data$ml_results)
+      save_current_plot(file, {
+        plot(
+          pipeline_data$ml_results$roc_object,
+          main = paste0("ROC Curve (AUC = ", round(pipeline_data$ml_results$auc_value, 3), ")")
+        )
+      }, width = 8, height = 6)
+    }
+  )
   
   
   # --- Server Logic for Tab 8: GSEA ---
@@ -1285,6 +1345,45 @@ server <- function(input, output, session) {
       padj_cutoff = input$gsea_padj_cutoff
     )
   })
+
+  output$dl_gsea_overview_plot <- downloadHandler(
+    filename = function() { paste0("gsea_overview_", input$gsea_module, ".pdf") },
+    content = function(file) {
+      req(pipeline_data$gsea_results)
+      save_current_plot(file, print(plot_gsea_results(
+        pipeline_data$gsea_results,
+        input$gsea_padj_cutoff,
+        input$gsea_source
+      )), width = 12, height = 8)
+    }
+  )
+
+  output$dl_gsea_network_plot <- downloadHandler(
+    filename = function() { paste0("gsea_network_", input$gsea_module, ".pdf") },
+    content = function(file) {
+      req(pipeline_data$gsea_results)
+      source_name <- if (is.null(input$gsea_source) || input$gsea_source == "All") "Hallmark" else input$gsea_source
+      save_current_plot(file, print(plot_gsea_network(
+        pipeline_data$gsea_results,
+        source_name,
+        input$gsea_padj_cutoff
+      )), width = 10, height = 8)
+    }
+  )
+
+  output$dl_gsea_curve_plot <- downloadHandler(
+    filename = function() { paste0("gsea_curve_", input$gsea_module, ".pdf") },
+    content = function(file) {
+      req(pipeline_data$gsea_results)
+      source_name <- if (is.null(input$gsea_source) || input$gsea_source == "All") "Hallmark" else input$gsea_source
+      save_current_plot(file, print(plot_gsea_enrichment_curve(
+        pipeline_data$gsea_results,
+        source_name = source_name,
+        pathway_name = input$gsea_pathway,
+        padj_cutoff = input$gsea_padj_cutoff
+      )), width = 9, height = 6)
+    }
+  )
   
   
   # --- Server Logic for Tab 9: ORA ---
@@ -1358,6 +1457,31 @@ server <- function(input, output, session) {
     DT::datatable(hub_df, options = list(pageLength = 10, scrollX = TRUE))
   })
 
+  output$dl_ora_overview_plot <- downloadHandler(
+    filename = function() { paste0("ora_overview_", input$ora_module, ".pdf") },
+    content = function(file) {
+      req(pipeline_data$ora_results)
+      save_current_plot(file, print(plot_ora_results(
+        pipeline_data$ora_results,
+        input$ora_padj_cutoff,
+        input$ora_source
+      )), width = 12, height = 8)
+    }
+  )
+
+  output$dl_ora_cnet_plot <- downloadHandler(
+    filename = function() { paste0("ora_network_", input$ora_module, ".pdf") },
+    content = function(file) {
+      req(pipeline_data$ora_results)
+      source_name <- if (is.null(input$ora_source) || input$ora_source == "All") "GO_BP" else input$ora_source
+      save_current_plot(file, print(plot_ora_cnet(
+        pipeline_data$ora_results,
+        source_name,
+        input$ora_padj_cutoff
+      )), width = 10, height = 8)
+    }
+  )
+
   # --- Server Logic for Tab 10: Supplementary ---
   observeEvent(input$run_supp_btn, {
     if (is.null(pipeline_data$loaded_data)) {
@@ -1426,6 +1550,46 @@ server <- function(input, output, session) {
     req(pipeline_data$supp_results)
     plot_supp_cohort_heatmap(pipeline_data$supp_results, "ADRC")
   })
+
+  output$dl_supp_preservation_plot <- downloadHandler(
+    filename = "supplementary_preservation.pdf",
+    content = function(file) {
+      req(pipeline_data$supp_results)
+      save_current_plot(file, print(plot_supp_preservation(pipeline_data$supp_results)), width = 8, height = 6)
+    }
+  )
+
+  output$dl_supp_forest_plot <- downloadHandler(
+    filename = "supplementary_sensitivity.pdf",
+    content = function(file) {
+      req(pipeline_data$supp_results)
+      save_current_plot(file, print(plot_supp_forest(pipeline_data$supp_results)), width = 9, height = 6)
+    }
+  )
+
+  output$dl_supp_hub_plot <- downloadHandler(
+    filename = "supplementary_hub_proteins.pdf",
+    content = function(file) {
+      req(pipeline_data$supp_results)
+      save_current_plot(file, print(plot_supp_top_hubs(pipeline_data$supp_results)), width = 10, height = 8)
+    }
+  )
+
+  output$dl_supp_heatmap_adni <- downloadHandler(
+    filename = "supplementary_heatmap_adni.pdf",
+    content = function(file) {
+      req(pipeline_data$supp_results)
+      save_current_plot(file, plot_supp_cohort_heatmap(pipeline_data$supp_results, "ADNI"), width = 12, height = 8)
+    }
+  )
+
+  output$dl_supp_heatmap_adrc <- downloadHandler(
+    filename = "supplementary_heatmap_adrc.pdf",
+    content = function(file) {
+      req(pipeline_data$supp_results)
+      save_current_plot(file, plot_supp_cohort_heatmap(pipeline_data$supp_results, "ADRC"), width = 12, height = 8)
+    }
+  )
 }
 
 # 4. --- RUN THE APP ---
