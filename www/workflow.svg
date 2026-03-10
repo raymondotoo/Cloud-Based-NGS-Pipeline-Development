@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1200" height="520" viewBox="0 0 1200 520" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 12; }
+      .title { font: 600 16px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 12px Arial, sans-serif; fill: #475569; }
+      .arrow { stroke: #94a3b8; stroke-width: 2; marker-end: url(#arrowhead); }
+      .lane { font: 600 14px Arial, sans-serif; fill: #334155; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="520" rx="16"/>
+
+  <text class="lane" x="40" y="50">ADNI-ADRC Proteomics Workflow</text>
+  <text class="subtitle" x="40" y="75">Inputs to analysis outputs, generated within the app pipeline</text>
+
+  <!-- Row 1 -->
+  <rect class="box" x="40" y="110" width="210" height="90"/>
+  <text class="title" x="55" y="145">Inputs</text>
+  <text class="subtitle" x="55" y="168">Phenotype + Proteomics</text>
+  <text class="subtitle" x="55" y="188">Annotation + Optional BG</text>
+
+  <rect class="box" x="290" y="110" width="210" height="90"/>
+  <text class="title" x="305" y="145">Preprocessing</text>
+  <text class="subtitle" x="305" y="168">QC, impute, WMH PCA</text>
+
+  <rect class="box" x="540" y="110" width="210" height="90"/>
+  <text class="title" x="555" y="145">Harmonization</text>
+  <text class="subtitle" x="555" y="168">ComBat batch correction</text>
+
+  <rect class="box" x="790" y="110" width="210" height="90"/>
+  <text class="title" x="805" y="145">PCA</text>
+  <text class="subtitle" x="805" y="168">Trait decomposition</text>
+
+  <!-- Row 2 -->
+  <rect class="box" x="40" y="260" width="210" height="90"/>
+  <text class="title" x="55" y="295">WGCNA</text>
+  <text class="subtitle" x="55" y="318">Modules + eigengenes</text>
+
+  <rect class="box" x="290" y="260" width="210" height="90"/>
+  <text class="title" x="305" y="295">Module Scoring</text>
+  <text class="subtitle" x="305" y="318">Trait hit categories</text>
+
+  <rect class="box" x="540" y="260" width="210" height="90"/>
+  <text class="title" x="555" y="295">Machine Learning</text>
+  <text class="subtitle" x="555" y="318">Predict outcomes</text>
+
+  <rect class="box" x="790" y="260" width="210" height="90"/>
+  <text class="title" x="805" y="295">Functional Analysis</text>
+  <text class="subtitle" x="805" y="318">GSEA + ORA</text>
+
+  <!-- Row 3 -->
+  <rect class="box" x="40" y="410" width="210" height="90"/>
+  <text class="title" x="55" y="445">Supplementary</text>
+  <text class="subtitle" x="55" y="468">Preservation + Sensitivity</text>
+
+  <!-- Arrows row 1 -->
+  <line class="arrow" x1="250" y1="155" x2="290" y2="155"/>
+  <line class="arrow" x1="500" y1="155" x2="540" y2="155"/>
+  <line class="arrow" x1="750" y1="155" x2="790" y2="155"/>
+
+  <!-- Arrow down -->
+  <line class="arrow" x1="895" y1="200" x2="895" y2="260"/>
+
+  <!-- Arrows row 2 -->
+  <line class="arrow" x1="250" y1="305" x2="290" y2="305"/>
+  <line class="arrow" x1="500" y1="305" x2="540" y2="305"/>
+  <line class="arrow" x1="750" y1="305" x2="790" y2="305"/>
+
+  <!-- Arrow down to supplementary -->
+  <line class="arrow" x1="145" y1="350" x2="145" y2="410"/>
+
+</svg>

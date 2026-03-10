@@ -276,73 +276,132 @@ run_module_scoring <- function(moduleTraitCor, moduleTraitP, r_thresh, q_thresh)
 
 # --- Helper for Machine Learning (aligned to 06_ADNI_ADRC_ML.Rmd) ---
 
-run_ml_analysis <- function(MEs, traits, target_col, split_ratio, alpha) {
-  
+run_ml_analysis <- function(MEs, traits, target_col, split_ratio, alpha, model_type = "elastic_net") {
   # Align samples
   common_samples <- intersect(rownames(MEs), rownames(traits))
   MEs <- MEs[common_samples, , drop = FALSE]
   traits <- traits[common_samples, , drop = FALSE]
-  
+
   # Prepare data frame for modeling
   ml_df <- data.frame(
     MEs,
     outcome = factor(traits[[target_col]])
   )
   ml_df <- ml_df[!is.na(ml_df$outcome), ]
-  
+
   if (length(unique(ml_df$outcome)) < 2) {
     stop("Outcome variable has fewer than 2 classes.")
   }
-  
+
   # Train/Test Split
   set.seed(42)
   train_idx <- caret::createDataPartition(ml_df$outcome, p = split_ratio, list = FALSE)
   train_df <- ml_df[train_idx, ]
   test_df  <- ml_df[-train_idx, ]
-  
+
   # Feature Scaling
   preproc <- caret::preProcess(train_df %>% dplyr::select(-outcome), method = c("center", "scale"))
   X_train <- predict(preproc, train_df %>% dplyr::select(-outcome))
   X_test  <- predict(preproc, test_df %>% dplyr::select(-outcome))
   y_train <- train_df$outcome
   y_test  <- test_df$outcome
-  
-  # Elastic Net Model
-  y01 <- as.numeric(y_train == levels(y_train)[2])
-  cv_fit <- glmnet::cv.glmnet(
-    x = as.matrix(X_train),
-    y = y01,
-    family = "binomial",
-    alpha = alpha,
-    nfolds = 5,
-    standardize = FALSE
-  )
-  
-  best_lambda <- cv_fit$lambda.min
-  
-  # Evaluation
-  test_probs <- as.numeric(predict(cv_fit, newx = as.matrix(X_test), s = best_lambda, type = "response"))
+
+  train_scaled <- data.frame(X_train, outcome = y_train)
+  test_scaled <- data.frame(X_test, outcome = y_test)
+
+  model_type <- tolower(model_type)
+  test_probs <- NULL
+  coef_df <- data.frame()
+  model_label <- model_type
+
+  if (model_type == "elastic_net") {
+    y01 <- as.numeric(y_train == levels(y_train)[2])
+    cv_fit <- glmnet::cv.glmnet(
+      x = as.matrix(X_train),
+      y = y01,
+      family = "binomial",
+      alpha = alpha,
+      nfolds = 5,
+      standardize = FALSE
+    )
+
+    best_lambda <- cv_fit$lambda.min
+    test_probs <- as.numeric(predict(cv_fit, newx = as.matrix(X_test), s = best_lambda, type = "response"))
+
+    coef_mat <- coef(cv_fit, s = best_lambda)
+    coef_df <- data.frame(
+      Feature = rownames(coef_mat),
+      Score = as.numeric(coef_mat),
+      stringsAsFactors = FALSE
+    ) %>%
+      dplyr::filter(Feature != "(Intercept)", Score != 0) %>%
+      dplyr::arrange(desc(abs(Score)))
+
+    model_label <- "Elastic Net (glmnet)"
+  } else if (model_type == "logistic") {
+    fit <- stats::glm(outcome ~ ., data = train_scaled, family = stats::binomial())
+    test_probs <- as.numeric(stats::predict(fit, newdata = test_scaled, type = "response"))
+    coef_df <- data.frame(
+      Feature = names(stats::coef(fit)),
+      Score = as.numeric(stats::coef(fit)),
+      stringsAsFactors = FALSE
+    ) %>%
+      dplyr::filter(Feature != "(Intercept)") %>%
+      dplyr::arrange(desc(abs(Score)))
+
+    model_label <- "Logistic Regression"
+  } else if (model_type == "random_forest") {
+    if (!requireNamespace("randomForest", quietly = TRUE)) {
+      stop("Package 'randomForest' is required for the random forest model.")
+    }
+    fit <- randomForest::randomForest(outcome ~ ., data = train_scaled)
+    test_probs <- as.numeric(stats::predict(fit, newdata = test_scaled, type = "prob")[, 2])
+    if (!is.null(fit$importance)) {
+      coef_df <- data.frame(
+        Feature = rownames(fit$importance),
+        Score = as.numeric(fit$importance[, 1]),
+        stringsAsFactors = FALSE
+      ) %>%
+        dplyr::arrange(desc(Score))
+    }
+    model_label <- "Random Forest"
+  } else {
+    stop("Unknown model type.")
+  }
+
+  if (is.null(test_probs)) {
+    stop("Model failed to produce probability predictions.")
+  }
+
   levels_y <- levels(y_test)
   test_pred_class <- ifelse(test_probs > 0.5, levels_y[2], levels_y[1])
   test_pred_factor <- factor(test_pred_class, levels = levels_y)
-  
+
   cm <- caret::confusionMatrix(test_pred_factor, y_test, positive = levels_y[2])
   roc_obj <- pROC::roc(response = y_test, predictor = as.numeric(test_probs), levels = levels_y, quiet = TRUE)
-  
-  # Coefficients
-  coef_mat <- coef(cv_fit, s = best_lambda)
-  coef_df <- data.frame(
-    Module = rownames(coef_mat),
-    Coefficient = as.numeric(coef_mat)
-  ) %>%
-    dplyr::filter(Module != "(Intercept)", Coefficient != 0) %>%
-    dplyr::arrange(desc(abs(Coefficient)))
-  
+
+  if (nrow(coef_df) == 0) {
+    coef_df <- data.frame(
+      Feature = "No feature weights available for this model.",
+      Score = NA_real_
+    )
+  }
+
+  metrics <- data.frame(
+    Model = model_label,
+    AUC = as.numeric(pROC::auc(roc_obj)),
+    Train_Samples = nrow(train_df),
+    Test_Samples = nrow(test_df),
+    stringsAsFactors = FALSE
+  )
+
   return(list(
     confusion_matrix = cm,
     roc_object = roc_obj,
     auc_value = pROC::auc(roc_obj),
-    coefficients = coef_df
+    coefficients = coef_df,
+    metrics = metrics,
+    model_label = model_label
   ))
 }
 

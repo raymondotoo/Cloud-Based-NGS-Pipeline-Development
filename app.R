@@ -13,11 +13,8 @@ suppressPackageStartupMessages({
 load_app_packages <- function(pkgs) {
   missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing_pkgs) > 0) {
-    stop(
-      "Missing required packages for the app: ",
-      paste(missing_pkgs, collapse = ", "),
-      call. = FALSE
-    )
+    message("Installing missing packages: ", paste(missing_pkgs, collapse = ", "))
+    utils::install.packages(missing_pkgs, repos = "https://cloud.r-project.org")
   }
 
   invisible(lapply(pkgs, function(p) {
@@ -29,7 +26,8 @@ load_app_packages <- function(pkgs) {
 required_pkgs <- c(
   "WGCNA", "dplyr", "readr", "clusterProfiler", "org.Hs.eg.db", "enrichplot",
   "ReactomePA", "ggplot2", "openxlsx", "fgsea", "msigdbr", "tidyr",
-  "tibble", "pheatmap", "stringr", "caret", "glmnet", "pROC", "DT", "sva", "imputeLCMD", "ggrepel", "impute"
+  "tibble", "pheatmap", "stringr", "caret", "glmnet", "pROC", "DT", "sva",
+  "imputeLCMD", "ggrepel", "impute", "randomForest"
 )
 
 message("Loading required packages...")
@@ -170,6 +168,9 @@ ui <- tagList(
                           )
                         ),
                         mainPanel(
+                          h3("Workflow Overview"),
+                          tags$img(src = "workflow.svg", style = "max-width: 100%; border: 1px solid #e2e8f0; border-radius: 12px;"),
+                          hr(),
                           h3("Pipeline Status"),
                           verbatimTextOutput("data_status_output")
                         )
@@ -289,31 +290,66 @@ ui <- tagList(
                       )
              ),
              
-             # --- Tab 7: Machine Learning ---
-             tabPanel("7. Machine Learning",
-                      sidebarLayout(
-                        sidebarPanel(
+            # --- Tab 7: Machine Learning ---
+            tabPanel("7. Machine Learning",
+                     sidebarLayout(
+                       sidebarPanel(
                           h4("ML Parameters"),
                           p("These parameters follow the canonical machine-learning notebook `06_ADNI_ADRC_ML.Rmd`."),
+                          selectInput(
+                            "ml_model",
+                            "Model",
+                            choices = c(
+                              "Elastic Net (glmnet)" = "elastic_net",
+                              "Logistic Regression" = "logistic",
+                              "Random Forest" = "random_forest"
+                            ),
+                            selected = "elastic_net"
+                          ),
                           selectInput("ml_target_col", "Target Variable", choices = c("stroke", "AD_status", "caa")),
                           sliderInput("ml_split_ratio", "Train/Test Split Ratio", value = 0.7, min = 0.5, max = 0.9),
-                          sliderInput("ml_alpha", "Elastic Net Alpha", value = 0.5, min = 0, max = 1),
+                          conditionalPanel(
+                            condition = "input.ml_model == 'elastic_net'",
+                            sliderInput("ml_alpha", "Elastic Net Alpha", value = 0.5, min = 0, max = 1)
+                          ),
                           actionButton("run_ml_btn", "Run ML Model", class = "btn-primary"),
                           hr(),
                           wellPanel(
                               h4("About This Step"),
                               p("This step uses the module eigengenes (MEs) as features to predict a clinical outcome (e.g., 'stroke'). Using MEs instead of thousands of individual proteins drastically reduces the number of features, mitigates multiple testing issues, and incorporates biological structure into the model."),
-                              p("An Elastic Net (a combination of LASSO and Ridge regression) is used for its ability to handle correlated predictors and perform automatic feature selection, identifying the most predictive modules.")
+                              p("Multiple model options are available. Elastic Net remains the default because it balances interpretability with predictive performance on correlated module eigengenes."),
+                              h4("Computation Notes"),
+                              tags$ul(
+                                tags$li("Elastic Net: 5-fold CV on standardized eigengenes using glmnet; coefficients are reported at lambda.min."),
+                                tags$li("Logistic Regression: GLM with binomial link on standardized eigengenes; coefficients are reported directly."),
+                                tags$li("Random Forest: default randomForest settings on standardized eigengenes; variable importance is reported.")
+                              ),
+                              p("All models use a train/test split and are evaluated with ROC AUC and a 0.5 decision threshold for the confusion matrix.")
                           )
                         ),
                         mainPanel(
-                          div(style = "height: 800px; overflow-y: scroll; margin-top: 20px;",
-                              h3("Model Performance"),
-                              verbatimTextOutput("ml_cm_output"),
-                              plotOutput("ml_roc_plot"),
-                              downloadButton("dl_ml_roc_plot", "Download ROC Plot"),
-                              h3("Top Predictors"),
-                              DT::dataTableOutput("ml_coeffs_output")
+                          h3("Model Performance"),
+                          tabsetPanel(
+                            tabPanel("Summary",
+                                     div(class = "analysis-card",
+                                         h4("Metrics"),
+                                         tableOutput("ml_metrics_output")
+                                     ),
+                                     div(class = "analysis-card",
+                                         h4("Confusion Matrix"),
+                                         verbatimTextOutput("ml_cm_output")
+                                     )),
+                            tabPanel("ROC Curve",
+                                     div(class = "analysis-card",
+                                         h4("ROC Curve"),
+                                         plotOutput("ml_roc_plot", height = "420px"),
+                                         downloadButton("dl_ml_roc_plot", "Download ROC Plot")
+                                     )),
+                            tabPanel("Top Features",
+                                     div(class = "analysis-card",
+                                         h4("Feature Weights or Importance"),
+                                         DT::dataTableOutput("ml_coeffs_output")
+                                     ))
                           )
                         )
                       ),
@@ -1226,7 +1262,8 @@ server <- function(input, output, session) {
         traits     = pipeline_data$loaded_data$traits,
         target_col = input$ml_target_col,
         split_ratio = input$ml_split_ratio,
-        alpha       = input$ml_alpha
+        alpha       = if (!is.null(input$ml_alpha)) input$ml_alpha else 0.5,
+        model_type  = input$ml_model
       )
     }, error = function(e) {
       showNotification(paste("ML failed:", conditionMessage(e)), type = "error")
@@ -1235,12 +1272,16 @@ server <- function(input, output, session) {
     
     if (!is.null(ml_results)) {
       pipeline_data$ml_results <- ml_results
+      output$ml_metrics_output <- renderTable({
+        ml_results$metrics
+      })
+      
       output$ml_cm_output <- renderPrint({
         print(ml_results$confusion_matrix)
       })
       
       output$ml_roc_plot <- renderPlot({
-        plot(ml_results$roc_object, main = paste0("ROC Curve (AUC = ", round(ml_results$auc_value, 3), ")"))
+        plot(ml_results$roc_object, main = paste0(ml_results$model_label, " ROC (AUC = ", round(ml_results$auc_value, 3), ")"))
       })
       
       output$ml_coeffs_output <- DT::renderDataTable({
@@ -1250,13 +1291,13 @@ server <- function(input, output, session) {
   })
 
   output$dl_ml_roc_plot <- downloadHandler(
-    filename = function() { paste0("ml_roc_", input$ml_target_col, ".pdf") },
+    filename = function() { paste0("ml_roc_", input$ml_target_col, "_", input$ml_model, ".pdf") },
     content = function(file) {
       req(pipeline_data$ml_results)
       save_current_plot(file, {
         plot(
           pipeline_data$ml_results$roc_object,
-          main = paste0("ROC Curve (AUC = ", round(pipeline_data$ml_results$auc_value, 3), ")")
+          main = paste0(pipeline_data$ml_results$model_label, " ROC (AUC = ", round(pipeline_data$ml_results$auc_value, 3), ")")
         )
       }, width = 8, height = 6)
     }
