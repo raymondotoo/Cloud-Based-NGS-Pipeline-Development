@@ -764,7 +764,8 @@ run_harmonization <- function(expr_data, pheno_data, batch_col) {
   # Ensure expr_data is numeric matrix (samples x features)
   # ComBat expects features x samples
   is_num <- sapply(expr_data, is.numeric)
-  dat <- t(as.matrix(expr_data[, is_num]))
+  expr_numeric <- expr_data[, is_num, drop = FALSE]
+  dat <- t(as.matrix(expr_numeric))
   
   # Check for NAs (ComBat doesn't like them)
   if (any(is.na(dat))) stop("Expression data contains NAs. Run preprocessing first.")
@@ -778,10 +779,18 @@ run_harmonization <- function(expr_data, pheno_data, batch_col) {
   
   # Run ComBat
   mod <- model.matrix(~1, data = pheno_data)
-  pca_before <- stats::prcomp(expr_data[, is_num, drop = FALSE], scale. = TRUE)
+  pca_input_before <- expr_numeric[, apply(expr_numeric, 2, stats::var, na.rm = TRUE) > 0, drop = FALSE]
+  if (ncol(pca_input_before) < 2) {
+    stop("Not enough non-constant numeric proteomic features available for harmonization PCA diagnostics.")
+  }
+  pca_before <- stats::prcomp(pca_input_before, scale. = TRUE)
   combat_edata <- sva::ComBat(dat = dat, batch = batch, mod = mod, par.prior = TRUE, prior.plots = FALSE)
   harmonized_expr <- t(combat_edata)
-  pca_after <- stats::prcomp(harmonized_expr, scale. = TRUE)
+  pca_input_after <- harmonized_expr[, apply(harmonized_expr, 2, stats::var, na.rm = TRUE) > 0, drop = FALSE]
+  if (ncol(pca_input_after) < 2) {
+    stop("Not enough non-constant numeric proteomic features available after ComBat for PCA diagnostics.")
+  }
+  pca_after <- stats::prcomp(pca_input_after, scale. = TRUE)
   
   list(
     expr = harmonized_expr,
