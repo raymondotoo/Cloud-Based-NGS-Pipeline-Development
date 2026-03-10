@@ -591,7 +591,7 @@ plot_gsea_network <- function(gsea_bundle, source_name, padj_cutoff = 0.05, n_pa
   sig_res <- get_sig_gsea_results(gsea_bundle, padj_cutoff, source_name) %>%
     dplyr::slice_max(order_by = abs(NES), n = n_pathways, with_ties = FALSE)
 
-  if (nrow(sig_res) == 0) {
+  if (nrow(sig_res) == 0 || !("leadingEdge" %in% colnames(sig_res))) {
     return(empty_plot(
       title = paste("No network plot available for", source_name),
       subtitle = "No significant leading-edge pathways matched the current cutoff."
@@ -606,6 +606,14 @@ plot_gsea_network <- function(gsea_bundle, source_name, padj_cutoff = 0.05, n_pa
     unique(symbols[!is.na(symbols)])
   })
   names(gene_list_symbols) <- clean_pathway_label(sig_res$pathway, width = 20)
+
+  gene_list_symbols <- gene_list_symbols[lengths(gene_list_symbols) > 0]
+  if (length(gene_list_symbols) == 0) {
+    return(empty_plot(
+      title = paste("No network plot available for", source_name),
+      subtitle = "Leading-edge genes were empty after filtering."
+    ))
+  }
 
   enrichplot::cnetplot(
     gene_list_symbols,

@@ -136,6 +136,8 @@ ui <- tagList(
                           p("Decompose phenotype variables into Principal Components (e.g., WMH traits)."),
                           selectInput("pca_vars", "Select Traits for PCA", choices = NULL, multiple = TRUE),
                           selectInput("pca_color_col", "Color Samples by (Optional)", choices = NULL),
+                          selectInput("pca_flip_pc", "Flip PC Axis (Plot Only)", choices = c("None", "PC1", "PC2", "PC3", "PC4", "PC5"), selected = "None"),
+                          actionButton("pca_flip_help", "Why Flip?", class = "btn-link"),
                           actionButton("run_pca_btn", "Run PCA", class = "btn-primary"),
                           hr(),
                           wellPanel(
@@ -854,20 +856,43 @@ server <- function(input, output, session) {
     pipeline_data$pca_results <- pca_res
     pipeline_data$pca_samples <- rownames(pheno_sub)
   })
+
+  observeEvent(input$pca_flip_help, {
+    showModal(modalDialog(
+      title = "Why flip a principal component?",
+      p("PCA axes are arbitrary up to sign: multiplying a component by -1 does not change the variance explained or relationships between samples."),
+      p("Flipping a component can make plots align with expected biological directionality or match other references."),
+      easyClose = TRUE,
+      footer = modalButton("Close")
+    ))
+  })
+
+  pca_for_plot <- reactive({
+    req(pipeline_data$pca_results)
+    pca_obj <- pipeline_data$pca_results
+    if (is.null(input$pca_flip_pc) || input$pca_flip_pc == "None") {
+      return(pca_obj)
+    }
+    pc_name <- input$pca_flip_pc
+    if (pc_name %in% colnames(pca_obj$x)) {
+      pca_obj$x[, pc_name] <- -pca_obj$x[, pc_name]
+    }
+    if (pc_name %in% colnames(pca_obj$rotation)) {
+      pca_obj$rotation[, pc_name] <- -pca_obj$rotation[, pc_name]
+    }
+    pca_obj
+  })
   
   output$pca_scree_plot <- renderPlot({
-    req(pipeline_data$pca_results)
-    plot_pca_scree(pipeline_data$pca_results)
+    plot_pca_scree(pca_for_plot())
   })
   
   output$pca_biplot <- renderPlot({
-    req(pipeline_data$pca_results)
-    plot_pca_biplot(pipeline_data$pca_results)
+    plot_pca_biplot(pca_for_plot())
   })
   
   output$pca_loadings_plot <- renderPlot({
-    req(pipeline_data$pca_results)
-    grid::grid.draw(plot_pca_loadings_heatmap(pipeline_data$pca_results))
+    grid::grid.draw(plot_pca_loadings_heatmap(pca_for_plot()))
   })
   
   output$dl_pca_plots <- downloadHandler(
@@ -877,14 +902,14 @@ server <- function(input, output, session) {
       pdf(file, width = 10, height = 8)
       
       # Scree
-      print(plot_pca_scree(pipeline_data$pca_results))
+      print(plot_pca_scree(pca_for_plot()))
       
       # Biplot
-      print(plot_pca_biplot(pipeline_data$pca_results))
+      print(plot_pca_biplot(pca_for_plot()))
       
       # Loadings
       grid::grid.newpage()
-      grid::grid.draw(plot_pca_loadings_heatmap(pipeline_data$pca_results))
+      grid::grid.draw(plot_pca_loadings_heatmap(pca_for_plot()))
       
       dev.off()
     }
