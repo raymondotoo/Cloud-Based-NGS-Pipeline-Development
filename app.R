@@ -207,35 +207,47 @@ ui <- tagList(
                         ),
                         mainPanel(
                           h3("WGCNA Outputs"),
-                          div(style = "height: 800px; overflow-y: scroll; margin-top: 20px;",
-                              
-                              h4("A. Sample Clustering (QC)"),
-                              plotOutput("wgcna_sample_tree", height = "400px"),
-                              downloadButton("download_sample_tree", "Download Plot"),
-                              br(), hr(),
-                              
-                              h4("B. Scale-Free Topology"),
-                              plotOutput("wgcna_sft_fit_plot", height = "400px"),
-                              downloadButton("download_sft_fit", "Download Plot"),
-                              br(), hr(),
-                              
-                              h4("B. Mean Connectivity"),
-                              plotOutput("wgcna_sft_mean_plot", height = "400px"),
-                              downloadButton("download_sft_mean", "Download Plot"),
-                              br(), hr(),
-                              
-                              h4("C. Gene Dendrogram and Module Colors"),
-                              plotOutput("wgcna_dendro_plot", height = "600px"),
-                              downloadButton("download_dendro", "Download Dendrogram"),
-                              br(), hr(),
-                              
-                              h4("D. Eigengene Clustering"),
-                              plotOutput("wgcna_eigengene_plot", height = "400px"),
-                              downloadButton("download_eigengene", "Download Eigengene Plot"),
-                              br(), hr(),
-                              h4("E. Module-Trait Relationships"),
-                              plotOutput("wgcna_trait_heatmap", height = "800px"),
-                              downloadButton("download_heatmap", "Download Heatmap")
+                          tabsetPanel(
+                            tabPanel("Quality Control",
+                                     div(class = "analysis-card",
+                                         h4("Sample Clustering"),
+                                         p(class = "section-note", "Hierarchical clustering of samples after WGCNA input QC."),
+                                         plotOutput("wgcna_sample_tree", height = "420px"),
+                                         downloadButton("download_sample_tree", "Download Plot")
+                                     )),
+                            tabPanel("Soft Threshold",
+                                     div(class = "analysis-card",
+                                         h4("Scale-Free Topology"),
+                                         p(class = "section-note", "Used to choose a soft-threshold power consistent with scale-free network behavior."),
+                                         plotOutput("wgcna_sft_fit_plot", height = "420px"),
+                                         downloadButton("download_sft_fit", "Download Plot")
+                                     ),
+                                     div(class = "analysis-card",
+                                         h4("Mean Connectivity"),
+                                         p(class = "section-note", "Connectivity profile across candidate powers."),
+                                         plotOutput("wgcna_sft_mean_plot", height = "420px"),
+                                         downloadButton("download_sft_mean", "Download Plot")
+                                     )),
+                            tabPanel("Modules",
+                                     div(class = "analysis-card",
+                                         h4("Gene Dendrogram and Module Colors"),
+                                         p(class = "section-note", "Dynamic tree cut modules and merged color assignments."),
+                                         plotOutput("wgcna_dendro_plot", height = "620px"),
+                                         downloadButton("download_dendro", "Download Dendrogram")
+                                     ),
+                                     div(class = "analysis-card",
+                                         h4("Eigengene Clustering"),
+                                         p(class = "section-note", "Relationships among module eigengenes after module construction."),
+                                         plotOutput("wgcna_eigengene_plot", height = "420px"),
+                                         downloadButton("download_eigengene", "Download Eigengene Plot")
+                                     )),
+                            tabPanel("Trait Heatmap",
+                                     div(class = "analysis-card",
+                                         h4("Module-Trait Relationships"),
+                                         p(class = "section-note", "Correlations between module eigengenes and selected phenotype traits."),
+                                         plotOutput("wgcna_trait_heatmap", height = "820px"),
+                                         downloadButton("download_heatmap", "Download Heatmap")
+                                     ))
                           )
                         )
                       ),

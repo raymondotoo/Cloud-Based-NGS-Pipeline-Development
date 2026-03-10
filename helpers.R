@@ -836,6 +836,32 @@ infer_cohort_labels <- function(sample_ids, traits = NULL) {
   )
 }
 
+prepare_preservation_set <- function(expr_subset, module_colors) {
+  if (is.null(expr_subset) || nrow(expr_subset) < 3 || ncol(expr_subset) < 10) {
+    return(NULL)
+  }
+
+  gsg <- WGCNA::goodSamplesGenes(expr_subset, verbose = 0)
+  expr_clean <- expr_subset
+  colors_clean <- module_colors
+
+  if (!gsg$allOK) {
+    expr_clean <- expr_subset[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+    colors_clean <- module_colors[gsg$goodGenes]
+  }
+
+  keep_var <- apply(expr_clean, 2, stats::var, na.rm = TRUE) > 0
+  keep_var[is.na(keep_var)] <- FALSE
+  expr_clean <- expr_clean[, keep_var, drop = FALSE]
+  colors_clean <- colors_clean[keep_var]
+
+  if (nrow(expr_clean) < 3 || ncol(expr_clean) < 10) {
+    return(NULL)
+  }
+
+  list(expr = expr_clean, colors = as.character(colors_clean))
+}
+
 run_supplementary_analysis <- function(wgcna_objects, selected_modules = NULL, n_permutations = 100) {
   expr <- wgcna_objects[["expr"]]
   MEs <- wgcna_objects[["MEs"]]
@@ -863,46 +889,69 @@ run_supplementary_analysis <- function(wgcna_objects, selected_modules = NULL, n
   preservation_raw <- NULL
 
   if (sum(cohort == "ADNI", na.rm = TRUE) > 10 && sum(cohort == "ADRC", na.rm = TRUE) > 10) {
-    multiExpr <- list(
-      ADNI = list(data = expr[cohort == "ADNI" & valid_cohort, , drop = FALSE]),
-      ADRC = list(data = expr[cohort == "ADRC" & valid_cohort, , drop = FALSE])
+    adni_set <- prepare_preservation_set(
+      expr[cohort == "ADNI" & valid_cohort, , drop = FALSE],
+      moduleColors
     )
-    multiColor <- list(
-      ADNI = as.character(moduleColors),
-      ADRC = as.character(moduleColors)
-    )
-
-    pres <- WGCNA::modulePreservation(
-      multiExpr,
-      multiColor = multiColor,
-      referenceNetworks = 1,
-      nPermutations = n_permutations,
-      networkType = "signed",
-      randomSeed = 123,
-      verbose = 0
+    adrc_set <- prepare_preservation_set(
+      expr[cohort == "ADRC" & valid_cohort, , drop = FALSE],
+      moduleColors
     )
 
-    adrc_slot <- grep("ADRC", names(pres$preservation$Z$ref.ADNI), value = TRUE)[1]
-    if (!is.na(adrc_slot) && length(selected_modules) > 0) {
-      z_stats <- pres$preservation$Z$ref.ADNI[[adrc_slot]][selected_modules, , drop = FALSE]
-      obs_stats <- pres$preservation$observed$ref.ADNI[[adrc_slot]][selected_modules, , drop = FALSE]
-      preservation_summary <- data.frame(
-        Module = rownames(z_stats),
-        Size = z_stats$moduleSize,
-        Z_ADRC = z_stats$Zsummary.pres,
-        medianRank_ADRC = obs_stats$medianRank.pres,
-        stringsAsFactors = FALSE
-      ) %>%
-        dplyr::mutate(
-          Preservation_Status = dplyr::case_when(
-            Z_ADRC > 10 ~ "Strongly Preserved",
-            Z_ADRC > 2 ~ "Moderately Preserved",
-            TRUE ~ "Weak/No Preservation"
-          )
-        ) %>%
-        dplyr::arrange(medianRank_ADRC)
+    if (!is.null(adni_set) && !is.null(adrc_set)) {
+      common_genes <- intersect(colnames(adni_set$expr), colnames(adrc_set$expr))
 
-      preservation_raw <- pres
+      if (length(common_genes) >= 10) {
+        adni_expr <- adni_set$expr[, common_genes, drop = FALSE]
+        adrc_expr <- adrc_set$expr[, common_genes, drop = FALSE]
+        color_idx <- match(common_genes, names(moduleColors))
+        common_colors <- as.character(moduleColors[color_idx])
+
+        multiExpr <- list(
+          ADNI = list(data = adni_expr),
+          ADRC = list(data = adrc_expr)
+        )
+        multiColor <- list(
+          ADNI = common_colors,
+          ADRC = common_colors
+        )
+
+        pres <- WGCNA::modulePreservation(
+          multiExpr,
+          multiColor = multiColor,
+          referenceNetworks = 1,
+          nPermutations = n_permutations,
+          networkType = "signed",
+          randomSeed = 123,
+          verbose = 0
+        )
+
+        adrc_slot <- grep("ADRC", names(pres$preservation$Z$ref.ADNI), value = TRUE)[1]
+        if (!is.na(adrc_slot) && length(selected_modules) > 0) {
+          keep_modules <- intersect(selected_modules, rownames(pres$preservation$Z$ref.ADNI[[adrc_slot]]))
+          if (length(keep_modules) > 0) {
+            z_stats <- pres$preservation$Z$ref.ADNI[[adrc_slot]][keep_modules, , drop = FALSE]
+            obs_stats <- pres$preservation$observed$ref.ADNI[[adrc_slot]][keep_modules, , drop = FALSE]
+            preservation_summary <- data.frame(
+              Module = rownames(z_stats),
+              Size = z_stats$moduleSize,
+              Z_ADRC = z_stats$Zsummary.pres,
+              medianRank_ADRC = obs_stats$medianRank.pres,
+              stringsAsFactors = FALSE
+            ) %>%
+              dplyr::mutate(
+                Preservation_Status = dplyr::case_when(
+                  Z_ADRC > 10 ~ "Strongly Preserved",
+                  Z_ADRC > 2 ~ "Moderately Preserved",
+                  TRUE ~ "Weak/No Preservation"
+                )
+              ) %>%
+              dplyr::arrange(medianRank_ADRC)
+
+            preservation_raw <- pres
+          }
+        }
+      }
     }
   }
 
