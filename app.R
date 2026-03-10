@@ -66,13 +66,21 @@ ui <- tagList(
              # --- Tab 1: Inputs & Preprocessing ---
              tabPanel("1. Inputs",
                       sidebarLayout(
-                        sidebarPanel(
+                       sidebarPanel(
                           h4("Required Inputs"),
                           p("Upload the source files once here. Downstream steps derive PCA, ComBat, and WGCNA objects from this run."),
                           fileInput("raw_proto_file", "Proteomics Data (Expression)", accept = c(".xlsx", ".csv")),
                           fileInput("raw_pheno_file", "Phenotype Data", accept = c(".xlsx", ".csv")),
                           fileInput("analyte_info_init", "Analyte Annotation (TSV)", accept = c(".tsv", ".txt")),
                           fileInput("background_init", "Background Gene List (Optional CSV)", accept = c(".csv")),
+                          hr(),
+                          h4("Sample Inputs"),
+                          p("Use packaged sample files instead of uploads."),
+                          selectInput("sample_proto_file", "Sample Proteomics", choices = NULL),
+                          selectInput("sample_pheno_file", "Sample Phenotype", choices = NULL),
+                          selectInput("sample_analyte_file", "Sample Annotation", choices = NULL),
+                          selectInput("sample_background_file", "Sample Background", choices = NULL),
+                          actionButton("load_sample_btn", "Load Sample Data", class = "btn-secondary"),
                           selectInput("impute_method", "Imputation Method", choices = c("Hybrid", "KNN", "Minimum", "None"), selected = "Hybrid"),
                           actionButton("run_preprocess_btn", "Run Preprocessing", class = "btn-primary"),
                           hr(),
@@ -566,6 +574,14 @@ server <- function(input, output, session) {
     on.exit(grDevices::dev.off(), add = TRUE)
     force(expr)
   }
+
+  sample_data_dir <- "data"
+  list_sample_files <- function(filenames) {
+    files <- file.path(sample_data_dir, filenames)
+    files <- files[file.exists(files)]
+    if (length(files) == 0) return(character(0))
+    setNames(files, basename(files))
+  }
   
   # Reactive values to store data and results across steps
   pipeline_data <- reactiveValues(
@@ -595,7 +611,73 @@ server <- function(input, output, session) {
   }
   
   # --- Server Logic for Tab 1: Preprocessing ---
-  
+
+  observe({
+    updateSelectInput(
+      session,
+      "sample_proto_file",
+      choices = list_sample_files(c("all_ADRC_ADNI_proteomics_samples_Zscore_soma_only.xlsx"))
+    )
+    updateSelectInput(
+      session,
+      "sample_pheno_file",
+      choices = list_sample_files(c("all_ADRC_ADNI_csfprot_wmhpheno_CLEAN_FINAL_10_24_2025.xlsx"))
+    )
+    updateSelectInput(
+      session,
+      "sample_analyte_file",
+      choices = list_sample_files(c("CSF_SOMAscan7k_analyte_information.tsv"))
+    )
+    updateSelectInput(
+      session,
+      "sample_background_file",
+      choices = list_sample_files(c("background_soma.csv"))
+    )
+  })
+
+  run_preprocess_with_data <- function(proto, pheno, analyte_path = NULL, background_path = NULL) {
+    pipeline_data$raw_proto <- proto
+    pipeline_data$raw_pheno <- pheno
+    pipeline_data$analyte_info <- analyte_path
+    pipeline_data$background <- background_path
+
+    res <- run_preprocessing(proto, pheno, input$impute_method)
+    pipeline_data$processed_data <- res
+    pipeline_data$pca_results <- if (!is.null(res$wmh_pca)) res$wmh_pca$pca else NULL
+    pipeline_data$pca_samples <- if (!is.null(res$wmh_pca)) res$wmh_pca$scores$SampleID else NULL
+
+    pipeline_data$harmonized <- NULL
+    pipeline_data$harmonized_expr <- NULL
+    pipeline_data$loaded_data <- NULL
+    pipeline_data$wgcna_results <- NULL
+    pipeline_data$trait_cor_results <- NULL
+    pipeline_data$sft_results <- NULL
+    pipeline_data$ml_results <- NULL
+    pipeline_data$gsea_results <- NULL
+    pipeline_data$ora_results <- NULL
+    pipeline_data$supp_results <- NULL
+
+    batch_choices <- colnames(res$pheno)
+    default_batch <- if ("Cohort" %in% batch_choices) "Cohort" else batch_choices[1]
+    updateSelectInput(session, "batch_col", choices = batch_choices, selected = default_batch)
+
+    pheno_for_pca <- if (!is.null(res$pheno_raw)) res$pheno_raw else res$pheno
+    nums <- names(pheno_for_pca)[sapply(pheno_for_pca, is.numeric)]
+    default_pca_vars <- intersect(canonical_wmh_vars(), nums)
+    if (length(default_pca_vars) == 0) default_pca_vars <- nums[1:min(5, length(nums))]
+    updateSelectInput(session, "pca_vars", choices = nums, selected = default_pca_vars)
+    updateSelectInput(session, "pca_color_col", choices = c("None", names(pheno_for_pca)))
+
+    pipeline_data$status <- paste(
+      "Inputs loaded.",
+      "\nProteomics rows:", nrow(res$expr),
+      "\nProteomics features:", ncol(res$expr),
+      "\nPhenotype rows:", nrow(res$pheno),
+      "\nWMH PCA derived:", !is.null(res$wmh_pca),
+      "\nAnalyte annotation set:", !is.null(analyte_path)
+    )
+  }
+
   observeEvent(input$run_preprocess_btn, {
     req(input$raw_proto_file, input$raw_pheno_file)
     
@@ -615,53 +697,37 @@ server <- function(input, output, session) {
         pheno <- read.csv(input$raw_pheno_file$datapath)
       }
       
-      pipeline_data$raw_proto <- proto
-      pipeline_data$raw_pheno <- pheno
-      pipeline_data$analyte_info <- if (!is.null(input$analyte_info_init)) input$analyte_info_init$datapath else NULL
-      pipeline_data$background <- if (!is.null(input$background_init)) input$background_init$datapath else NULL
-
-      # Run preprocessing
-      res <- run_preprocessing(proto, pheno, input$impute_method)
-      pipeline_data$processed_data <- res
-      pipeline_data$pca_results <- if (!is.null(res$wmh_pca)) res$wmh_pca$pca else NULL
-      pipeline_data$pca_samples <- if (!is.null(res$wmh_pca)) res$wmh_pca$scores$SampleID else NULL
-      
-      # Clear downstream results to prevent mismatch
-      pipeline_data$harmonized <- NULL
-      pipeline_data$harmonized_expr <- NULL
-      pipeline_data$loaded_data <- NULL
-      pipeline_data$wgcna_results <- NULL
-      pipeline_data$trait_cor_results <- NULL
-      pipeline_data$sft_results <- NULL
-      pipeline_data$ml_results <- NULL
-      pipeline_data$gsea_results <- NULL
-      pipeline_data$ora_results <- NULL
-      pipeline_data$supp_results <- NULL
-      
-      # Update UI choices for next steps
-      batch_choices <- colnames(res$pheno)
-      default_batch <- if("Cohort" %in% batch_choices) "Cohort" else batch_choices[1]
-      updateSelectInput(session, "batch_col", choices = batch_choices, selected = default_batch)
-
-      pheno_for_pca <- if (!is.null(res$pheno_raw)) res$pheno_raw else res$pheno
-      nums <- names(pheno_for_pca)[sapply(pheno_for_pca, is.numeric)]
-      default_pca_vars <- intersect(canonical_wmh_vars(), nums)
-      if (length(default_pca_vars) == 0) default_pca_vars <- nums[1:min(5, length(nums))]
-      updateSelectInput(session, "pca_vars", choices = nums, selected = default_pca_vars)
-      updateSelectInput(session, "pca_color_col", choices = c("None", names(pheno_for_pca)))
-      
-      pipeline_data$status <- paste(
-        "Inputs loaded.",
-        "\nProteomics rows:", nrow(res$expr),
-        "\nProteomics features:", ncol(res$expr),
-        "\nPhenotype rows:", nrow(res$pheno),
-        "\nWMH PCA derived:", !is.null(res$wmh_pca),
-        "\nAnalyte annotation uploaded:", !is.null(pipeline_data$analyte_info)
+      run_preprocess_with_data(
+        proto,
+        pheno,
+        analyte_path = if (!is.null(input$analyte_info_init)) input$analyte_info_init$datapath else NULL,
+        background_path = if (!is.null(input$background_init)) input$background_init$datapath else NULL
       )
       showNotification("Preprocessing complete.", type = "message")
       
     }, error = function(e) {
       showNotification(paste("Preprocessing failed:", conditionMessage(e)), type = "error")
+    })
+  })
+
+  observeEvent(input$load_sample_btn, {
+    req(input$sample_proto_file, input$sample_pheno_file)
+    tryCatch({
+      proto_path <- input$sample_proto_file
+      pheno_path <- input$sample_pheno_file
+      analyte_path <- if (!is.null(input$sample_analyte_file) && nzchar(input$sample_analyte_file)) input$sample_analyte_file else NULL
+      background_path <- if (!is.null(input$sample_background_file) && nzchar(input$sample_background_file)) input$sample_background_file else NULL
+
+      proto_ext <- tools::file_ext(proto_path)
+      pheno_ext <- tools::file_ext(pheno_path)
+
+      proto <- if (proto_ext == "xlsx") openxlsx::read.xlsx(proto_path) else read.csv(proto_path)
+      pheno <- if (pheno_ext == "xlsx") openxlsx::read.xlsx(pheno_path) else read.csv(pheno_path)
+
+      run_preprocess_with_data(proto, pheno, analyte_path, background_path)
+      showNotification("Sample preprocessing complete.", type = "message")
+    }, error = function(e) {
+      showNotification(paste("Sample preprocessing failed:", conditionMessage(e)), type = "error")
     })
   })
   
